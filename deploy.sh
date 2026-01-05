@@ -1,84 +1,211 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
 # =================================================================
-# 项目：Sing-box 自动化运维系统 (YouTube 演示专用)
-# 功能：BBR/证书/Nginx回落/HY2(可选混淆)/一键回滚
+# 项目：Sing-box 全能自动化部署系统（HY2 UDP-only，改进版）
+# 说明：明确将 HY2 仅绑定 UDP（HY2 监听本地 HY2_PORT，脚本使用 iptables 将外部 UDP 443 重定向到 HY2_PORT）
+#      支持可选 Reality server_name、Cloudflare DNS（acme.sh dns_cf）申请证书、
+#      HY2 obfs 默认关闭，仅在用户选择时开启。
+# 重点：逻辑完备、错误保护、备份与回滚（保守），并修复若干路径/命令检测问题。
+# 注意：本脚本使用 IPv4 iptables NAT REDIRECT；若系统使用 nftables 或仅 IPv6，请按需修改。
 # =================================================================
 
-# --- [ 0. 全局变量与配色 ] ---
-CONF_DIR="/etc/sing-box"
-CERT_DIR="/etc/v2ray-agent/tls"
-NGINX_CONF="/etc/nginx/sites-available/default"
-RAND_PORT=$(shuf -i 10000-60000 -n 1) 
-UUID=$(cat /proc/sys/kernel/random/uuid)
-RED='\033[0;31m' && GREEN='\033[0;32m' && BLUE='\033[0;34m' && NC='\033[0m'
+set -euo pipefail
+IFS=$'\n\t'
 
-# --- [ 1. 基础引擎模块 ] ---
-function init_engine() {
-    echo -e "${BLUE}[1/6] 开启内核加速 (BBR) 并同步系统工具...${NC}"
-    # 写入并生效 BBR 优化
-    sed -i '/net.core/d' /etc/sysctl.conf && sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p > /dev/null
-    apt update && apt install -y curl socat wget jq lsof tar nginx
+# ---------------- 全局配置 ----------------
+CONF_DIR="${CONF_DIR:-/etc/sing-box}"
+CERT_DIR="${CERT_DIR:-/etc/v2ray-agent/tls}"
+NGINX_CONF="${NGINX_CONF:-/etc/nginx/sites-available/default}"
+RANDOM_PORT="${RANDOM_PORT:-$(shuf -i 10000-60000 -n 1)}"   # Reality handshake 本地端口
+HY2_PORT="${HY2_PORT:-5443}"                               # HY2 实际监听端口（非 443），脚本会把 UDP:443 转发到此端口
+UUID="${UUID:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)}"
+LOGFILE="${LOGFILE:-/var/log/singbox-deploy.log}"
+
+RED='\033[0;31m' && GREEN='\033[0;32m' && YELLOW='\033[0;33m' && NC='\033[0m'
+
+log() { echo -e "[$(date '+%F %T')] $*" | tee -a "$LOGFILE"; }
+
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo -e "${RED}错误退出，查看日志 $LOGFILE${NC}"; journalctl -u sing-box --no-pager -n 80 || true; nginx -t || true; exit $rc; fi' ERR
+
+# ---------------- 基础前置检查 ----------------
+if [ "$(id -u)" -ne 0 ]; then
+  echo -e "${RED}请以 root 或 sudo 运行此脚本${NC}"
+  exit 1
+fi
+
+ensure_deps() {
+  if ! command -v apt >/dev/null 2>&1; then
+    log "${RED}仅支持 Debian/Ubuntu 系列自动安装。请手动安装依赖后重试：curl wget lsof jq tar shuf nginx iptables${NC}"
+    exit 1
+  fi
+  log "apt 更新并安装常用依赖..."
+  apt update -y
+  apt install -y curl wget lsof jq tar shuf nginx ca-certificates iptables >/dev/null
 }
 
-# --- [ 2. 原子化备份模块 ] ---
-function backup_environment() {
-    echo -e "${BLUE}[2/6] 正在执行系统环境原子备份...${NC}"
-    if [ -f "$NGINX_CONF" ] && [ ! -f "${NGINX_CONF}.orig" ]; then
-        cp "$NGINX_CONF" "${NGINX_CONF}.orig"
+backup_env() {
+  log "备份 nginx 配置与已有 sing-box 配置（保守模式）"
+  if [ -f "$NGINX_CONF" ] && [ ! -f "${NGINX_CONF}.orig" ]; then
+    cp -a "$NGINX_CONF" "${NGINX_CONF}.orig"
+    log "备份 $NGINX_CONF -> ${NGINX_CONF}.orig"
+  fi
+  if [ -d "$CONF_DIR" ] && [ ! -d "${CONF_DIR}.orig" ]; then
+    cp -a "$CONF_DIR" "${CONF_DIR}.orig" || true
+    log "备份 $CONF_DIR -> ${CONF_DIR}.orig"
+  fi
+}
+
+# ---------------- acme.sh 与证书 ----------------
+install_acme_sh_if_needed() {
+  if [ -x "/root/.acme.sh/acme.sh" ] || [ -x "${HOME}/.acme.sh/acme.sh" ]; then
+    return 0
+  fi
+  log "安装 acme.sh..."
+  curl -sSfL https://get.acme.sh | sh -s -- --nocron || { log "${RED}acme.sh 安装失败${NC}"; exit 1; }
+}
+
+issue_certificate() {
+  # mode: "http" 或 "dns"
+  local domain="$1" email="$2" mode="$3"
+  install_acme_sh_if_needed
+  ACME_SH="/root/.acme.sh/acme.sh"
+  [ ! -x "$ACME_SH" ] && ACME_SH="${HOME}/.acme.sh/acme.sh"
+  if [ ! -x "$ACME_SH" ]; then log "${RED}找不到 acme.sh${NC}"; exit 1; fi
+
+  mkdir -p "$CERT_DIR"
+  "$ACME_SH" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+  if [ "$mode" = "dns" ]; then
+    # 支持 Cloudflare (dns_cf)。需提供 CF_Token（推荐）
+    if [ -z "${CF_TOKEN:-}" ]; then
+      log "使用 DNS 模式申请证书（Cloudflare）。请提供 Cloudflare API Token（拥有 Zone:Edit 权限）"
+      read -rp "请输入 Cloudflare API Token（粘贴后回车）： " CF_TOKEN_INPUT
+      CF_TOKEN="${CF_TOKEN_INPUT:-$CF_TOKEN}"
     fi
-}
-
-# --- [ 3. 证书管理中心 ] ---
-function cert_manager() {
-    local domain=$1 && local email=$2
-    echo -e "${BLUE}[3/6] 正在申请 Let's Encrypt 证书...${NC}"
-    curl https://get.acme.sh | sh -s email="$email"
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    mkdir -p "$CERT_DIR"
-    # 智能选择申请模式
-    if lsof -i :80 > /dev/null; then
-        ~/.acme.sh/acme.sh --issue -d "$domain" --nginx
+    if [ -z "${CF_TOKEN:-}" ]; then
+      log "${RED}未提供 Cloudflare Token，无法使用 dns_cf 模式${NC}"
+      exit 1
+    fi
+    export CF_Token="$CF_TOKEN"
+    log "使用 acme.sh dns_cf 模式为 $domain 申请证书（Cloudflare）"
+    "$ACME_SH" --issue -d "$domain" --dns dns_cf || { log "${RED}dns_cf 申请失败${NC}"; exit 1; }
+  else
+    # http 模式：若 80 被占用且 nginx 可用，使用 --nginx 插件；否则 standalone
+    if lsof -i :80 >/dev/null 2>&1; then
+      if command -v nginx >/dev/null 2>&1; then
+        log "检测到端口 80 被占用，尝试使用 acme.sh --nginx 申请证书"
+        "$ACME_SH" --issue -d "$domain" --nginx || { log "${RED}--nginx 申请失败，请检查 nginx 配置${NC}"; exit 1; }
+      else
+        log "${RED}80 被占用且未检测到 nginx，请确保 80 可用或改用 DNS 方式申请证书${NC}"
+        exit 1
+      fi
     else
-        ~/.acme.sh/acme.sh --issue -d "$domain" --standalone
+      log "80 空闲，使用 standalone 模式申请证书"
+      "$ACME_SH" --issue -d "$domain" --standalone || { log "${RED}standalone 申请失败${NC}"; exit 1; }
     fi
-    ~/.acme.sh/acme.sh --install-cert -d "$domain" \
-        --key-file "$CERT_DIR/server.key" \
-        --fullchain-file "$CERT_DIR/server.crt"
+  fi
+
+  # 安装证书到 CERT_DIR
+  "$ACME_SH" --install-cert -d "$domain" \
+    --key-file "$CERT_DIR/server.key" \
+    --fullchain-file "$CERT_DIR/server.crt" || { log "${RED}证书写入失败${NC}"; exit 1; }
+
+  chmod 600 "$CERT_DIR/server.key" || true
+  chmod 644 "$CERT_DIR/server.crt" || true
+  log "证书已写入 $CERT_DIR"
 }
 
-# --- [ 4. Nginx 变阵模块 ] ---
-function nginx_adapter() {
-    echo -e "${BLUE}[4/6] 正在配置 Nginx 前端回落监听...${NC}"
-    cat <<EOF > "$NGINX_CONF"
+# ---------------- nginx 配置（回落 / 前置） ----------------
+configure_nginx() {
+  local mode="$1" # 1 回落(local listen), 2 CDN 前置
+  mkdir -p /var/www/html
+  if [ "$mode" = "1" ]; then
+    cat > "$NGINX_CONF" <<EOF
 server {
-    listen 127.0.0.1:$RAND_PORT;
+    listen 127.0.0.1:${RANDOM_PORT};
     server_name _;
     location / { root /var/www/html; index index.html; }
 }
 EOF
+  else
+    cat > "$NGINX_CONF" <<'EOF'
+# CDN 前置占位配置，请按需替换
+server {
+    listen 80 default_server;
+    server_name _;
+    location / { return 404; }
+}
+EOF
+  fi
+
+  if nginx -t >/dev/null 2>&1; then
     systemctl restart nginx
+    log "nginx 已应用并重启"
+  else
+    log "${RED}nginx 配置测试失败，请检查 $NGINX_CONF${NC}"
+    exit 1
+  fi
 }
 
-# --- [ 5. Sing-box 部署模块 ] ---
-function singbox_deploy() {
-    echo -e "${BLUE}[5/6] 正在安装 Sing-box 核心并生成配置...${NC}"
-    bash <(curl -Ls https://raw.githubusercontent.com/sagernet/sing-box/main/install.sh)
-    
-    RE_KEYS=$(/usr/bin/sing-box generate reality-keypair)
-    PUB_KEY=$(echo "$RE_KEYS" | grep "Public key" | awk '{print $3}')
-    PRIV_KEY=$(echo "$RE_KEYS" | grep "Private key" | awk '{print $3}')
+# ---------------- sing-box 部署 ----------------
+gen_password() { head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 20 || echo "obfs$(date +%s)"; }
 
-    # 处理 HY2 混淆逻辑：默认不开启
-    HY2_OBFS=""
-    if [[ "$ENABLE_OBFS" == "y" || "$ENABLE_OBFS" == "Y" ]]; then
-        HY2_OBFS=', "obfs": {"type": "salamander", "password": "unserionssss66688"}'
-    fi
+# SINGBOX_BIN detection
+SINGBOX_BIN="$(command -v sing-box || echo /usr/bin/sing-box)"
 
-    cat <<EOF > "$CONF_DIR/config.json"
+setup_udp443_redirect() {
+  # 把 IPv4 UDP 443 转发/重定向到本机 HY2_PORT
+  if ! command -v iptables >/dev/null 2>&1; then
+    log "${YELLOW}警告：iptables 未找到，无法添加 UDP 443 重定向规则。请手动配置或安装 iptables${NC}"
+    return 0
+  fi
+  log "配置 iptables：将 UDP 443 重定向到本机 UDP ${HY2_PORT}"
+  # 先尝试删除旧规则（若存在），防止重复添加（忽略错误）
+  iptables -t nat -D PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}" 2>/dev/null || true
+  iptables -t nat -A PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}"
+  log "iptables 规则已添加（IPv4 UDP 443 -> ${HY2_PORT}）"
+  log "注意：iptables 规则不会自动持久化，重启后会失效。可安装 iptables-persistent 或将规则写入启动脚本以持久化。"
+}
+
+remove_udp443_redirect() {
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -t nat -D PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}" 2>/dev/null || true
+  fi
+}
+
+deploy_singbox() {
+  local domain="$1"
+  local reality_sni="$2"
+  local enable_obfs="$3"
+
+  log "安装 sing-box（官方安装脚本）"
+  curl -fsSL https://raw.githubusercontent.com/sagernet/sing-box/main/install.sh | bash -s -- || { log "${RED}sing-box 安装失败${NC}"; exit 1; }
+
+  # 生成 Reality 密钥对（使用检测到的二进制）
+  if [ -x "$SINGBOX_BIN" ]; then
+    RE_KEYS=$("$SINGBOX_BIN" generate reality-keypair 2>/dev/null || true)
+  else
+    RE_KEYS=$(/usr/bin/sing-box generate reality-keypair 2>/dev/null || true)
+  fi
+  PUB_KEY=$(echo "$RE_KEYS" | sed -n 's/^[[:space:]]*Public key[: ]*//Ip' | tr -d '\r\n' || true)
+  PRIV_KEY=$(echo "$RE_KEYS" | sed -n 's/^[[:space:]]*Private key[: ]*//Ip' | tr -d '\r\n' || true)
+  if [ -z "$PUB_KEY" ] || [ -z "$PRIV_KEY" ]; then
+    log "${RED}生成 Reality 密钥失败，输出如下：${NC}"
+    echo "$RE_KEYS"
+    exit 1
+  fi
+
+  mkdir -p "$CONF_DIR"
+  local OBFS_BLOCK=""
+  if [[ "$enable_obfs" =~ ^[yY]$ ]]; then
+    OBFS_PWD="$(gen_password)"
+    OBFS_BLOCK=", \"obfs\": {\"type\": \"salamander\", \"password\": \"${OBFS_PWD}\"}"
+    log "HY2 混淆已启用（随机密码已生成）"
+  else
+    log "HY2 混淆保持关闭"
+  fi
+
+  # HY2 监听 HY2_PORT（非 443），然后将 IPv4 UDP 443 转发到 HY2_PORT，从而实现 UDP-only 的 443 行为
+  cat > "$CONF_DIR/config.json" <<EOF
 {
   "inbounds": [
     {
@@ -89,10 +216,10 @@ function singbox_deploy() {
       "users": [{"uuid": "$UUID", "flow": "xtls-rprx-vision"}],
       "tls": {
         "enabled": true,
-        "server_name": "www.microsoft.com",
+        "server_name": "$reality_sni",
         "reality": {
           "enabled": true,
-          "handshake": { "server": "127.0.0.1", "server_port": $RAND_PORT },
+          "handshake": { "server": "127.0.0.1", "server_port": $RANDOM_PORT },
           "private_key": "$PRIV_KEY",
           "short_id": ["6ba85179e30d4fc2"]
         }
@@ -102,13 +229,13 @@ function singbox_deploy() {
       "type": "hysteria2",
       "tag": "hy2-in",
       "listen": "::",
-      "listen_port": 443 ${HY2_OBFS},
+      "listen_port": ${HY2_PORT},
       "up_mbps": 120,
       "down_mbps": 120,
-      "users": [{"password": "$UUID"}],
+      "users": [{"password": "$UUID"}]${OBFS_BLOCK},
       "tls": {
         "enabled": true,
-        "server_name": "$DOMAIN",
+        "server_name": "$domain",
         "alpn": ["h3"],
         "certificate_path": "$CERT_DIR/server.crt",
         "key_path": "$CERT_DIR/server.key"
@@ -118,46 +245,128 @@ function singbox_deploy() {
   "outbounds": [{"type": "direct"}]
 }
 EOF
-    /usr/bin/sing-box check -c "$CONF_DIR/config.json" && systemctl enable --now sing-box
+
+  # 使用检测到的 sing-box 二进制进行校验并启动
+  if [ -x "$SINGBOX_BIN" ]; then
+    "$SINGBOX_BIN" check -c "$CONF_DIR/config.json" || { log "${RED}sing-box 配置校验失败${NC}"; exit 1; }
+  else
+    /usr/bin/sing-box check -c "$CONF_DIR/config.json" || { log "${RED}sing-box 配置校验失败${NC}"; exit 1; }
+  fi
+
+  # 添加 UDP 443 -> HY2_PORT 的 iptables 规则（IPv4）
+  setup_udp443_redirect
+
+  systemctl enable --now sing-box
+  log "sing-box 已启用并启动（HY2: UDP-only via redirect -> ${HY2_PORT}）"
 }
 
-# --- [ 6. 深度回滚模块 ] ---
-function rollback() {
-    echo -e "${RED}正在启动一键回滚，移除所有修改...${NC}"
-    systemctl stop sing-box 2>/dev/null
-    rm -rf "$CONF_DIR" "$CERT_DIR" /usr/local/bin/sing-box /etc/systemd/system/sing-box.service
-    if [ -f "${NGINX_CONF}.orig" ]; then
-        mv "${NGINX_CONF}.orig" "$NGINX_CONF"
-        systemctl restart nginx
-    fi
-    echo -e "${GREEN}系统已恢复至执行前的纯净状态。${NC}"
+# ---------------- 回滚（保守） ----------------
+rollback() {
+  log "一键回滚（保守）：停止 sing-box、移除 iptables 规则并恢复 nginx 配置"
+  systemctl stop sing-box || true
+  remove_udp443_redirect
+  if [ -f "${NGINX_CONF}.orig" ]; then
+    mv -f "${NGINX_CONF}.orig" "${NGINX_CONF}"
+    systemctl restart nginx || true
+    log "恢复 nginx 原配置"
+  fi
+  log "回滚完成（证书与配置备份保留以供人工审查）"
 }
 
-# --- [ 主入口 ] ---
+# ---------------- 主流程交互 ----------------
 clear
-echo -e "${GREEN}Sing-box 自动化运维系统 v2.0${NC}"
-echo "---------------------------"
-echo "1. 快速安装 (Reality + HY2)"
-echo "2. 一键回滚 (卸载并恢复原样)"
-echo "3. 退出"
-read -p "选择: " MAIN_OP
+echo -e "${GREEN}Sing-box 自动化部署（HY2 UDP-only 版，改进）${NC}"
+echo "运行日志：$LOGFILE"
+echo
 
-if [ "$MAIN_OP" == "2" ]; then rollback; exit 0; fi
-if [ "$MAIN_OP" != "1" ]; then exit 0; fi
+ensure_deps
+backup_env
 
-read -p "请输入域名: " DOMAIN
-read -p "请输入邮箱: " EMAIL
-read -p "是否开启 HY2 混淆(obfs)? 可能会导致卡顿 (y/n, 默认 n): " ENABLE_OBFS
-ENABLE_OBFS=${ENABLE_OBFS:-"n"}
+echo "请选择部署模式："
+echo " 1) 回落模式（Nginx -> Reality handshake）"
+echo " 2) CDN 前置（Nginx 前置，按需自定义）"
+echo " 3) 只做证书/网关（不输出节点）"
+read -rp "请输入 1/2/3 (默认 1): " MODE
+MODE="${MODE:-1}"
 
-init_engine && backup_environment
-cert_manager "$DOMAIN" "$EMAIL"
-nginx_adapter
-singbox_deploy
+read -rp "请输入主域名 (用于 HY2 TLS)： " DOMAIN
+if [ -z "$DOMAIN" ]; then
+  echo -e "${RED}必须输入主域名（用于 HY2 TLS certificate）${NC}"
+  exit 1
+fi
 
-echo -e "${GREEN}======================================"
-echo -e "部署成功！您的专属节点信息："
+read -rp "请输入邮箱（用于 Let's Encrypt）： " EMAIL
+
+DEFAULT_REALITY_SNI="www.oracle.com"
+echo
+echo "Reality (VLESS Reality) 中用于 SNI/server_name（可与主域不同）。"
+echo "按回车使用默认：${DEFAULT_REALITY_SNI}（建议使用自己的域名或子域）"
+read -rp "请输入 Reality server_name (回车使用默认): " REALITY_SNI
+REALITY_SNI="${REALITY_SNI:-$DEFAULT_REALITY_SNI}"
+
+echo
+echo "证书申请方式："
+echo " 1) HTTP (standalone / nginx 插件，可能会占用 80/443 临时端口)"
+echo " 2) DNS (Cloudflare - 推荐，当使用 CDN / Cloudflare 时无需占用 80/443)"
+read -rp "请选择 1 或 2 (默认 2): " CERT_MODE
+CERT_MODE="${CERT_MODE:-2}"
+
+if [ "$CERT_MODE" = "2" ]; then
+  if [ -z "${CF_TOKEN:-}" ]; then
+    echo
+    echo "使用 Cloudflare DNS 方式申请证书需要 API Token（拥有 Zone:Edit 权限）。"
+    read -rp "请输入 Cloudflare API Token（粘贴后回车，或回车跳过并用 HTTP 模式）: " CF_TOKEN_INPUT
+    if [ -n "$CF_TOKEN_INPUT" ]; then
+      export CF_Token="$CF_TOKEN_INPUT"
+      CF_TOKEN="$CF_TOKEN_INPUT"
+    else
+      echo "未提供 Cloudflare Token，改回 HTTP 模式。"
+      CERT_MODE=1
+    fi
+  else
+    export CF_Token="$CF_TOKEN"
+  fi
+fi
+
+read -rp "是否启用 HY2 混淆 obfs? (y/N，默认 N): " ENABLE_OBFS
+ENABLE_OBFS="${ENABLE_OBFS:-n}"
+
+echo
+echo "HY2 将监听本机端口: ${HY2_PORT} (本机)，并将外部 IPv4 UDP 443 重定向到该端口。"
+echo "注意：若希望 HY2 直接监听 UDP 443（无需转发），请确保内核/应用层支持且端口未被占用。"
+read -rp "确认并开始部署？输入 y 开始（其他键退出）: " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[yY]$ ]]; then
+  log "用户取消部署"
+  exit 0
+fi
+
+# 执行证书申请
+if [ "$CERT_MODE" = "2" ]; then
+  issue_certificate "$DOMAIN" "$EMAIL" "dns"
+else
+  issue_certificate "$DOMAIN" "$EMAIL" "http"
+fi
+
+# nginx 配置
+if [ "$MODE" = "1" ]; then
+  configure_nginx "1"
+else
+  configure_nginx "2"
+fi
+
+# 部署 sing-box（HY2 将监听 HY2_PORT）
+deploy_singbox "$DOMAIN" "$REALITY_SNI" "$ENABLE_OBFS"
+
+# 输出关键信息
+echo
+log "部署完成，重要信息如下："
+echo -e "${GREEN}======================================${NC}"
 echo -e "UUID: $UUID"
-echo -e "Reality 公钥: $PUB_KEY"
-echo -e "HY2 端口: 443 (UDP) | 混淆: ${ENABLE_OBFS}"
+echo -e "Reality 公钥: ${PUB_KEY:-<未解析>}"
+echo -e "Reality server_name (SNI): $REALITY_SNI"
+echo -e "HY2 TLS server_name: $DOMAIN"
+echo -e "HY2 本地监听端口: ${HY2_PORT} (UDP only via iptables redirect from UDP 443)"
+echo -e "配置文件: $CONF_DIR/config.json"
+echo -e "证书路径: $CERT_DIR"
+echo -e "日志: $LOGFILE"
 echo -e "======================================${NC}"
