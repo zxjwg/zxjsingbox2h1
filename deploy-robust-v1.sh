@@ -5,9 +5,9 @@
 #  - 保持原脚本总体逻辑（申请证书 -> 安装 sing-box -> 生成 Reality/Hy2 -> nginx 回落 -> UDP 转发）
 #  - 增加了：root 检查、包管理器检测、重试机制、超时、锁文件更安全的清理、日志、非交互 apt、nginx 配置检测/备份、
 #    acme.sh 与 cert 申请的回退、iptables/nftables 兼容性判断、错误 trap 与提示等
-#  - 适用：Debian/Ubuntu 优先；尝试在 CentOS/RHEL/Fedora 上做最小兼容（但原生 sing-box 安装脚本仍以 Debian 系列为主）
+#  - 默认跳过持久化 netfilter（适配外部/云平台管理的防火墙），通过 SKIP_NETFILTER_PERSISTENT 控制
+#  - 修复 acme.sh 安装时报 Unknown parameter: ----nocron 的问题：不再直接传递 --nocron 给安装脚本，改为安装后移除自动任务（如 crontab/systemd）以禁用自动升级/定时任务
 #
-
 set -euo pipefail
 
 # 日志
@@ -26,6 +26,9 @@ RANDOM_PORT=$(shuf -i 10000-60000 -n 1 2>/dev/null || echo "37210")
 HY2_PORT="5443"
 UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || (command -v uuidgen >/dev/null 2>&1 && uuidgen) || echo "$(openssl rand -hex 8)-$(openssl rand -hex 4)-$(openssl rand -hex 4)-$(openssl rand -hex 4)-$(openssl rand -hex 12)")"
 SHORT_ID="$(openssl rand -hex 8 || echo "sid$(date +%s)")"
+
+# 默认跳过持久化 netfilter（适配外部/云平台管理的防火墙）
+SKIP_NETFILTER_PERSISTENT="${SKIP_NETFILTER_PERSISTENT:-true}"
 
 # 超时/重试设置
 RETRY_MAX=5
@@ -86,7 +89,7 @@ detect_pkg_manager() {
 }
 
 safe_kill_locking_processes() {
-    # 尝试更温和的方式处理 apt/dpkg 锁
+    # 尝试更温和的方式处理 apt/dpkg 锁（仍保留，但不强制杀掉大量进程）
     info "尝试修复被锁定的包管理器状态（温和模式）..."
     dpkg --configure -a || true
     for lock in /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
@@ -109,11 +112,21 @@ install_packages() {
     detect_pkg_manager
     case "$PKG_MANAGER" in
         apt)
-            retry_cmd 5 apt-get update
-            retry_cmd 5 $PKG_INSTALL "${pkgs[@]}"
+            retry_cmd 5 apt-get update || warn "apt-get update 失败，继续..."
+            # 如果用户选择跳过 netfilter 持久化，则从列表中移除 iptables-persistent
+            if [ "$SKIP_NETFILTER_PERSISTENT" = "true" ]; then
+                local filtered=()
+                for p in "${pkgs[@]}"; do
+                    if [ "$p" != "iptables-persistent" ]; then
+                        filtered+=("$p")
+                    fi
+                done
+                pkgs=("${filtered[@]}")
+            fi
+            retry_cmd 5 $PKG_INSTALL "${pkgs[@]}" || warn "安装部分包失败，继续（某些包可能已经安装或配置错误）。"
             ;;
         dnf|yum)
-            retry_cmd 5 $PKG_INSTALL "${pkgs[@]}"
+            retry_cmd 5 $PKG_INSTALL "${pkgs[@]}" || warn "安装部分包失败，继续（某些包可能已经安装或配置错误）。"
             ;;
     esac
 }
@@ -129,6 +142,129 @@ choose_nginx_conf() {
     echo "/etc/nginx/sites-available/default"
 }
 
+# 检测端口是否被占用（TCP/UDP 通用）
+port_in_use() {
+    local port=$1
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -i :"$port" >/dev/null 2>&1 && return 0 || return 1
+    elif command -v ss >/dev/null 2>&1; then
+        ss -ltn | grep -q ":$port\b" && return 0 || return 1
+    else
+        return 1
+    fi
+}
+
+# 移除 acme.sh 安装过程中可能注册的自动任务（crontab 或 systemd/cron）
+disable_acmesh_auto() {
+    # remove crontab entries for acme.sh (root)
+    if command -v crontab >/dev/null 2>&1; then
+        if crontab -l 2>/dev/null | grep -q "acme.sh"; then
+            crontab -l 2>/dev/null | grep -v "acme.sh" | crontab - || true
+            info "已从 crontab 中移除 acme.sh 条目。"
+        fi
+    fi
+    # remove systemd user timer if present (unlikely for root)
+    if [ -d /etc/systemd/system ] && systemctl list-timers --all 2>/dev/null | grep -q acme; then
+        # try to disable any acme.sh timers
+        systemctl list-units --all | grep -i acme | awk '{print $1}' | while read -r unit; do
+            systemctl disable --now "$unit" 2>/dev/null || true
+        done
+        info "已尝试移除可能的 systemd acme 定时任务。"
+    fi
+}
+
+install_acme_sh_and_issue() {
+    info "[4/5] 正在通过 acme.sh 申请证书..."
+    ACME_INSTALL_TMP="/tmp/acme_install.sh"
+    ACME_HOME_CANDIDATES=("/root/.acme.sh" "$HOME/.acme.sh")
+
+    # 下载安装脚本到临时文件（不直接 pipe），以避免参数解析异常
+    if ! retry_cmd 3 curl $CURL_OPTS -o "$ACME_INSTALL_TMP" https://get.acme.sh; then
+        warn "下载 acme.sh 安装脚本失败，跳过自动安装/申请证书。"
+        return 1
+    fi
+
+    # 运行安装脚本 *不传递* --nocron，以避免安装器解析错误。安装完成后我们会主动移除自动任务以达到不使用 cron 的效果。
+    bash "$ACME_INSTALL_TMP" || true
+
+    # 尝试定位 acme.sh 可执行文件
+    ACME_BIN=""
+    for d in "${ACME_HOME_CANDIDATES[@]}"; do
+        if [ -x "$d/acme.sh" ]; then
+            ACME_BIN="$d/acme.sh"
+            ACME_HOME="$d"
+            break
+        fi
+    done
+    # fallback: check common location
+    if [ -z "$ACME_BIN" ] && [ -x "/root/.acme.sh/acme.sh" ]; then
+        ACME_BIN="/root/.acme.sh/acme.sh"
+        ACME_HOME="/root/.acme.sh"
+    fi
+
+    if [ -z "$ACME_BIN" ]; then
+        warn "未找到 acme.sh 安装位置，跳过证书自动申请。"
+        return 1
+    fi
+
+    # 禁用 acme.sh 安装时可能添加的定时任务/cron
+    disable_acmesh_auto
+
+    # 设置默认 CA
+    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+    # 选择申请模式：优先 standalone（需要 80/443 空闲），否则尝试 nginx 模式
+    if ! port_in_use 80 || ! port_in_use 443; then
+        # 如果任一端口空闲，尝试 standalone（会短暂监听）
+        info "尝试使用 standalone 模式申请（80/443 端口检测为可用）..."
+        # nginx 可能在运行，暂时停止以释放端口（只有在需要时）
+        local nginx_was_running=false
+        if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx >/dev/null 2>&1; then
+            nginx_was_running=true
+            systemctl stop nginx >/dev/null 2>&1 || true
+            info "暂时停止 nginx 以释放端口。"
+        fi
+
+        if "$ACME_BIN" --issue -d "$DOMAIN" --standalone --debug 2>/dev/null; then
+            "$ACME_BIN" --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt" || true
+            success "证书申请成功（standalone）。"
+            # 恢复 nginx
+            if [ "$nginx_was_running" = true ]; then
+                systemctl start nginx >/dev/null 2>&1 || true
+            fi
+            return 0
+        else
+            warn "standalone 模式申请失败，尝试 nginx 模式（若可用）..."
+            if [ "$nginx_was_running" = true ]; then
+                systemctl start nginx >/dev/null 2>&1 || true
+            fi
+        fi
+    else
+        info "80/443 端口被占用，跳过 standalone 模式，使用 nginx 模式或 webroot 模式。"
+    fi
+
+    # nginx 模式（需要 nginx 可用且配置兼容 acme.sh nginx 插件）
+    if command -v nginx >/dev/null 2>&1; then
+        if "$ACME_BIN" --issue -d "$DOMAIN" --nginx --debug 2>/dev/null; then
+            "$ACME_BIN" --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt" || true
+            success "证书申请成功（nginx）。"
+            return 0
+        fi
+    fi
+
+    # webroot fallback: 如果 /var/www/html 存在且可写
+    if [ -d "/var/www/html" ]; then
+        if "$ACME_BIN" --issue -d "$DOMAIN" --webroot /var/www/html --debug 2>/dev/null; then
+            "$ACME_BIN" --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt" || true
+            success "证书申请成功（webroot）。"
+            return 0
+        fi
+    fi
+
+    warn "所有自动申请证书的方式均已尝试但未成功。你可手动将证书放到 $CERT_DIR 并重试。"
+    return 1
+}
+
 # ---------------- start script ----------------
 if ! is_root; then
     err "请以 root 或使用 sudo 执行此脚本。"
@@ -138,12 +274,12 @@ fi
 info "开始部署 Sing-box（改进版）。详细日志记录到：$LOGFILE"
 
 # 1) 尝试温和解除锁、修复状态（避免强杀导致的卡死）
-info "[1/7] 处理可能的包管理器锁与中断状态..."
+info "[1/8] 处理可能的包管理器锁与中断状态..."
 safe_kill_locking_processes
 
 # 2) 安装基础依赖（带重试）
-info "[2/7] 安装系统依赖（请观察输出）..."
-BASE_PKGS=(curl wget lsof jq tar nginx ca-certificates iptables iproute2 openssl coreutils)
+info "[2/8] 安装系统依赖（请观察输出）..."
+BASE_PKGS=(curl wget lsof jq tar nginx ca-certificates iptables iproute2 openssl coreutils iptables-persistent)
 # uuid 工具在不同系统名称不同
 if command -v uuidgen >/dev/null 2>&1; then
     : # ok
@@ -152,19 +288,13 @@ else
 fi
 install_packages "${BASE_PKGS[@]}"
 
-# 确保 shuf 可用（coreutils）
-if ! command -v shuf >/dev/null 2>&1; then
-    warn "shuf 未安装，尝试通过 coreutils 提供或使用 fallback"
-fi
-
 # 3) 内核优化（BBR），只追加一次
-info "[3/7] 配置内核网络优化(BBR)"
+info "[3/8] 配置内核网络优化(BBR)"
 if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf 2>/dev/null; then
     cat >>/etc/sysctl.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-    # 立刻生效（忽略可能的错误）
     sysctl -p >/dev/null 2>&1 || true
     success "已写入 sysctl 配置并尝试生效。"
 else
@@ -186,7 +316,6 @@ echo -e "${YELLOW}--------------------------------------------------${NC}"
 # DNS 简单校验：检查域名是否指向当前服务器（若无法校验则仅提示）
 info "校验域名解析（尽可能）..."
 SERVER_IPV4="$(curl -4 -sS https://ifconfig.co || true)"
-# 尝试解析域名
 RESOLVED_IP="$(getent hosts "$DOMAIN" | awk '{print $1}' || true)"
 if [ -n "$RESOLVED_IP" ] && [ -n "$SERVER_IPV4" ] && [ "$RESOLVED_IP" != "$SERVER_IPV4" ]; then
     warn "域名 $DOMAIN 解析到 $RESOLVED_IP，而当前服务器公网 IPv4 为 $SERVER_IPV4。请确认 DNS 配置是否正确（如果是 IPv6-only 或特殊情况可忽略）。"
@@ -195,62 +324,11 @@ else
 fi
 
 # 5) 安装/申请证书（acme.sh），尽量容错
-info "[4/7] 安装 acme.sh 并申请 TLS 证书..."
-ACME_HOME="/root/.acme.sh"
-ACME_BIN="$ACME_HOME/acme.sh"
-if ! [ -x "$ACME_BIN" ]; then
-    info "安装 acme.sh..."
-    retry_cmd 3 curl $CURL_OPTS https://get.acme.sh | sh -s -- --nocron || true
-    # 可能安装到了其他用户目录，检查
-    if [ ! -x "$ACME_BIN" ] && [ -x "/root/.acme.sh/acme.sh" ]; then
-        ACME_BIN="/root/.acme.sh/acme.sh"
-    fi
-fi
-if [ ! -x "$ACME_BIN" ]; then
-    warn "acme.sh 安装失败或不可执行，后续尝试使用 certbot（如果可用）或跳过。"
-fi
-
 mkdir -p "$CERT_DIR"
-# 优先使用 acme.sh --standalone（会短暂占用 80/443），若失败则尝试 nginx 模式
-if [ -x "$ACME_BIN" ]; then
-    info "设置 acme 默认 CA 为 letsencrypt（忽略错误）..."
-    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-
-    info "尝试使用 acme.sh 的 standalone 模式申请证书（可能需要 80/443 暂时开放）..."
-    if "$ACME_BIN" --issue -d "$DOMAIN" --standalone --debug 2>/dev/null; then
-        "$ACME_BIN" --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt" || true
-        success "证书申请成功（standalone）。"
-    else
-        warn "standalone 模式失败，尝试 nginx 模式（确保 nginx 已启动并可访问）..."
-        # 确保 nginx 正在运行（先启动 nginx）
-        if command -v nginx >/dev/null 2>&1; then
-            systemctl restart nginx >/dev/null 2>&1 || true
-        fi
-        if "$ACME_BIN" --issue -d "$DOMAIN" --nginx --debug 2>/dev/null; then
-            "$ACME_BIN" --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt" || true
-            success "证书申请成功（nginx）。"
-        else
-            warn "acme.sh 通过两种模式均无法申请证书。"
-            # 尝试 certbot if available
-            if command -v certbot >/dev/null 2>&1; then
-                warn "尝试使用 certbot 申请证书..."
-                certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "${EMAIL:-admin@${DOMAIN}}" || warn "certbot 申请失败。"
-                # 复制证书（路径因系统不同）
-                if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-                    cp -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERT_DIR/server.crt"
-                    cp -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERT_DIR/server.key"
-                fi
-            else
-                warn "未找到可用的证书客户端，后续 TLS 可能无法启用，请手动提供证书到 $CERT_DIR。"
-            fi
-        fi
-    fi
-else
-    warn "acme.sh 不可用，跳过自动申请证书。请手动放置证书到 $CERT_DIR 并重试。"
-fi
+install_acme_sh_and_issue || warn "证书申请阶段未成功完成，后续 TLS 可能无法启用。"
 
 # 6) 安装 sing-box（官方脚本），用临时文件并加 timeout/重试
-info "[5/7] 安装 sing-box 程序..."
+info "[6/8] 安装 sing-box 程序..."
 SINGBOX_INSTALL_URL="https://raw.githubusercontent.com/sagernet/sing-box/main/install.sh"
 TMP_INSTALL="/tmp/singbox_install.sh"
 if retry_cmd 3 curl $CURL_OPTS "$SINGBOX_INSTALL_URL" -o "$TMP_INSTALL"; then
@@ -325,7 +403,7 @@ EOF
 
 # 8) Nginx 回落配置（选择合适配置文件并备份）
 NGINX_CONF="$(choose_nginx_conf)"
-info "[6/7] 配置 Nginx 回落站点到 $NGINX_CONF（备份原文件）"
+info "[7/8] 配置 Nginx 回落站点到 $NGINX_CONF（备份原文件）"
 if [ -f "$NGINX_CONF" ]; then
     cp -f "$NGINX_CONF" "$NGINX_CONF.bak-$(date +%s)" || true
 fi
@@ -350,15 +428,12 @@ if command -v nginx >/dev/null 2>&1; then
 fi
 
 # 9) 端口转发（iptables / nftables 兼容）
-info "[7/7] 配置 UDP 转发（443 -> $HY2_PORT）"
-# 准备 iptables 命令（优先使用系统中的 iptables）
+info "[8/8] 配置 UDP 转发（443 -> $HY2_PORT）"
 IPTABLES_CMD="$(command -v iptables || true)"
 IP6TABLES_CMD="$(command -v ip6tables || true)"
 NFT_CMD="$(command -v nft || true)"
 
-# IPv4
 if [ -n "$IPTABLES_CMD" ]; then
-    # 避免重复添加相同规则：检查后再加
     if ! $IPTABLES_CMD -t nat -C PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "$HY2_PORT" 2>/dev/null; then
         $IPTABLES_CMD -t nat -A PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "$HY2_PORT"
         info "已添加 iptables IPv4 规则。"
@@ -366,9 +441,7 @@ if [ -n "$IPTABLES_CMD" ]; then
         info "iptables IPv4 规则已存在，跳过。"
     fi
 elif [ -n "$NFT_CMD" ]; then
-    # nftables: 添加等效规则到 nat prerouting
     if ! nft list table inet nat >/dev/null 2>&1; then
-        # 创建 nat 表与 prerouting 链（若不存在）
         nft add table ip nat 2>/dev/null || true
         nft 'add chain ip nat prerouting { type nat hook prerouting priority 0 ; }' 2>/dev/null || true
     fi
@@ -379,15 +452,13 @@ elif [ -n "$NFT_CMD" ]; then
         info "nftables 规则已存在，跳过。"
     fi
 else
-    warn "未检测到 iptables 或 nft 工具，无法自动添加 IPv4 转发规则，请手动配置 UDP 443 -> $HY2_PORT 的重定向。"
+    warn "未检测到 iptables 或 nft 工具��无法自动添加 IPv4 转发规则，请手动配置 UDP 443 -> $HY2_PORT 的重定向。"
 fi
 
-# IPv6 NAT 并非在所有系统中可用；只有在 ip6tables 支持 nat 表时添加
 if [ -n "$IP6TABLES_CMD" ]; then
     if $IP6TABLES_CMD -t nat -C PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "$HY2_PORT" 2>/dev/null; then
         info "ip6tables IPv6 规则已存在，跳过。"
     else
-        # 某些系统不支持 -t nat（会报错），捕获错误并跳过
         if $IP6TABLES_CMD -t nat -A PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "$HY2_PORT" 2>/dev/null; then
             info "已添加 ip6tables IPv6 规则。"
         else
@@ -395,9 +466,7 @@ if [ -n "$IP6TABLES_CMD" ]; then
         fi
     fi
 elif [ -n "$NFT_CMD" ]; then
-    # nft IPv6 rule (ip6)
     if ! nft list table ip6 nat >/dev/null 2>&1; then
-        # try to create table ip6 nat
         nft add table ip6 nat 2>/dev/null || true
         nft 'add chain ip6 nat prerouting { type nat hook prerouting priority 0 ; }' 2>/dev/null || true
     fi
@@ -407,21 +476,25 @@ elif [ -n "$NFT_CMD" ]; then
     fi
 fi
 
-# 保存 netfilter 规则（如果 netfilter-persistent 可用或 iptables-save 可用）
-if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save || true
-elif command -v iptables-save >/dev/null 2>&1; then
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    if command -v ip6tables-save >/dev/null 2>&1; then
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+# 保存 netfilter 规则（如果 SKIP_NETFILTER_PERSISTENT=false 才持久化）
+if [ "$SKIP_NETFILTER_PERSISTENT" = "true" ]; then
+    warn "已配置为跳过持久化 netfilter 规则（SKIP_NETFILTER_PERSISTENT=true）。重启后规则可能丢失。"
+else
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save || warn "netfilter-persistent save 失败。"
+    elif command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || warn "iptables-save 写入失败。"
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || warn "ip6tables-save 写入失败。"
+        fi
+    else
+        warn "未找到 netfilter 持久化工具，请手动持久化规则。"
     fi
 fi
 
-# 启用并启动 sing-box 服务（若已安装 systemd service）
 if [ -n "$SYSTEMCTL_CMD" ] && [ -f "/etc/systemd/system/sing-box.service" -o -f "/lib/systemd/system/sing-box.service" ] ; then
     systemctl enable --now sing-box || warn "尝试启动 sing-box 服务失败，请检查服务状态：systemctl status sing-box"
 else
-    # 有可能安装后在 /etc/init.d/ 下，尝试直接启动
     if command -v sing-box >/dev/null 2>&1; then
         warn "sing-box 可执行文件存在但 systemd 单元未检测到，请手动创建/启动服务，或运行: sing-box run -c $CONF_DIR/config.json"
     else
@@ -438,6 +511,5 @@ echo -e "Reality ShortID: ${BLUE}$SHORT_ID${NC}"
 echo -e "HY2 本地端口: ${BLUE}$HY2_PORT (UDP 443 已尝试自动重定向)${NC}"
 success "=================================================="
 
-# 结尾提示：若某一步出现问题，查看日志并根据提示进行修复
 echo ""
 echo -e "${YELLOW}提示：若证书申请失败，请确认 80/443 端口未被其他进程占用，或手动将证书放置到 $CERT_DIR 并重启 sing-box。${NC}"
