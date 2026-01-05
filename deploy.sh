@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-
-# =================================================================
-# 项目：Sing-box 自动化部署系统 (V5.2 逻辑闭环版)
-# 修复：显式安装 socat，优化证书申请逻辑，确保不挂起
-# =================================================================
+# 项目：Sing-box 自动化部署系统 (V5.3 深度自愈版)
+# 核心：强制修复 apt 依赖 / 弃用防火墙组件 / Standalone 证书申请
 
 set -e
 
@@ -16,45 +13,45 @@ RANDOM_PORT=$(shuf -i 10000-60000 -n 1 2>/dev/null || echo "37210")
 UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(openssl rand -hex 8)-$(openssl rand -hex 4)-$(openssl rand -hex 4)-$(openssl rand -hex 4)-$(openssl rand -hex 12)")
 SHORT_ID=$(openssl rand -hex 8)
 
-# --- [ 1. 暴力清理系统锁 ] ---
-echo -e "${BLUE}[1/5] 正在解除系统锁定...${NC}"
+# --- [ 1. 暴力修复 apt 环境 ] ---
+echo -e "${BLUE}[1/5] 正在深度自愈系统安装环境...${NC}"
 systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 killall -9 apt apt-get dpkg 2>/dev/null || true
 rm -f /var/lib/dpkg/lock* /var/cache/debconf/*.dat
+
+# 核心自愈：卸载导致死锁的包，确保 apt 恢复正常
+DEBIAN_FRONTEND=noninteractive apt-get purge -y iptables-persistent 2>/dev/null || true
 DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
 
-# --- [ 2. 核心依赖安装 (加入 socat) ] ---
+# --- [ 2. 透明依赖安装 ] ---
 echo -e "${BLUE}[2/5] 正在安装必要依赖 (含 socat)...${NC}"
-export DEBIAN_FRONTEND=noninteractive
 apt-get update
-# 显式加入 socat，这是 standalone 模式成功的关键
-apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+# 确保安装 socat，这是证书申请的“心脏”
+DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
     curl wget lsof jq tar nginx ca-certificates uuid-runtime openssl coreutils socat
 
-# --- [ 3. 交互式输入 ] ---
+# --- [ 3. 交互输入 ] ---
 read -rp "请输入域名: " DOMAIN
 read -rp "请输入邮箱: " EMAIL
 read -rp "是否开启 HY2 混淆? (y/n, 默认 n): " IS_OBFS
 IS_OBFS=${IS_OBFS:-"n"}
 
-# --- [ 4. 证书申请 (优化逻辑) ] ---
-echo -e "${BLUE}[3/5] 正在通过 acme.sh 申请证书...${NC}"
-# 安装 acme.sh
+# --- [ 4. 证书申请 (Standalone 模式) ] ---
+echo -e "${BLUE}[3/5] 正在申请 TLS 证书...${NC}"
 if [ ! -f "/root/.acme.sh/acme.sh" ]; then
     curl https://get.acme.sh | sh -s email="$EMAIL" || true
 fi
 ACME="/root/.acme.sh/acme.sh"
-
 $ACME --set-default-ca --server letsencrypt
 mkdir -p "$CERT_DIR"
 
-# 关键：停止 Nginx 释放 80 端口，确保 standalone 模式 100% 成功
+# 停止 Nginx 释放 80 端口，给 socat 让路
 systemctl stop nginx || true
 $ACME --issue -d "$DOMAIN" --standalone
 $ACME --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt"
 
 # --- [ 5. Sing-box 部署 ] ---
-echo -e "${BLUE}[4/5] 正在安装 Sing-box 核心...${NC}"
+echo -e "${BLUE}[4/5] 安装 Sing-box 并配置双协议...${NC}"
 curl -fsSL https://raw.githubusercontent.com/sagernet/sing-box/main/install.sh | bash -s --
 
 RE_KEYS=$(/usr/bin/sing-box generate reality-keypair)
@@ -93,8 +90,8 @@ cat > "$CONF_DIR/config.json" <<EOF
 }
 EOF
 
-# --- [ 6. 伪装站与服务激活 ] ---
-echo -e "${BLUE}[5/5] 配置伪装站并重启服务...${NC}"
+# --- [ 6. Nginx 伪装与自启 ] ---
+echo -e "${BLUE}[5/5] 配置 Nginx 伪装并启动服务...${NC}"
 cat > "$NGINX_CONF" <<EOF
 server {
     listen 127.0.0.1:$RANDOM_PORT;
