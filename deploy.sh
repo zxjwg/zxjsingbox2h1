@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # =================================================================
-# 项目：Sing-box 自动化部署系统 (V5.1 证书修复版)
-# 说明：修复 acme.sh 安装参数错误，直接监听 443 端口
+# 项目：Sing-box 自动化部署系统 (V5.2 逻辑闭环版)
+# 修复：显式安装 socat，优化证书申请逻辑，确保不挂起
 # =================================================================
 
 set -e
@@ -23,12 +23,13 @@ killall -9 apt apt-get dpkg 2>/dev/null || true
 rm -f /var/lib/dpkg/lock* /var/cache/debconf/*.dat
 DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
 
-# --- [ 2. 核心依赖安装 ] ---
-echo -e "${BLUE}[2/5] 正在安装必要依赖...${NC}"
+# --- [ 2. 核心依赖安装 (加入 socat) ] ---
+echo -e "${BLUE}[2/5] 正在安装必要依赖 (含 socat)...${NC}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
+# 显式加入 socat，这是 standalone 模式成功的关键
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-    curl wget lsof jq tar nginx ca-certificates uuid-runtime openssl coreutils
+    curl wget lsof jq tar nginx ca-certificates uuid-runtime openssl coreutils socat
 
 # --- [ 3. 交互式输入 ] ---
 read -rp "请输入域名: " DOMAIN
@@ -36,20 +37,20 @@ read -rp "请输入邮箱: " EMAIL
 read -rp "是否开启 HY2 混淆? (y/n, 默认 n): " IS_OBFS
 IS_OBFS=${IS_OBFS:-"n"}
 
-# --- [ 4. 证书申请 (修复参数逻辑) ] ---
+# --- [ 4. 证书申请 (优化逻辑) ] ---
 echo -e "${BLUE}[3/5] 正在通过 acme.sh 申请证书...${NC}"
-# 修复：使用更标准的安装命令，避免 --nocron 的连字符冲突
+# 安装 acme.sh
 if [ ! -f "/root/.acme.sh/acme.sh" ]; then
     curl https://get.acme.sh | sh -s email="$EMAIL" || true
 fi
-# 定义 acme.sh 绝对路径
 ACME="/root/.acme.sh/acme.sh"
-[ ! -f "$ACME" ] && ACME="/.acme.sh/acme.sh" # 备选路径
 
 $ACME --set-default-ca --server letsencrypt
 mkdir -p "$CERT_DIR"
-# 优先使用 Standalone 申请
-$ACME --issue -d "$DOMAIN" --standalone || $ACME --issue -d "$DOMAIN" --nginx
+
+# 关键：停止 Nginx 释放 80 端口，确保 standalone 模式 100% 成功
+systemctl stop nginx || true
+$ACME --issue -d "$DOMAIN" --standalone
 $ACME --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt"
 
 # --- [ 5. Sing-box 部署 ] ---
@@ -92,8 +93,8 @@ cat > "$CONF_DIR/config.json" <<EOF
 }
 EOF
 
-# --- [ 6. 伪装与启动 ] ---
-echo -e "${BLUE}[5/5] 配置 Nginx 伪装并启动服务...${NC}"
+# --- [ 6. 伪装站与服务激活 ] ---
+echo -e "${BLUE}[5/5] 配置伪装站并重启服务...${NC}"
 cat > "$NGINX_CONF" <<EOF
 server {
     listen 127.0.0.1:$RANDOM_PORT;
