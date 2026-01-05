@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # =================================================================
-# 项目：Sing-box 全能自动化部署系统（HY2 UDP-only，改进版）
-# 说明：明确将 HY2 仅绑定 UDP（HY2 监听本地 HY2_PORT，脚本使用 iptables 将外部 UDP 443 重定向到 HY2_PORT）
-#      支持可选 Reality server_name、Cloudflare DNS（acme.sh dns_cf）申请证书、
-#      HY2 obfs 默认关闭，仅在用户选择时开启。
-# 重点：逻辑完备、错误保护、备份与回滚（保守），并修复若干路径/命令检测问题。
-# 注意：本脚本使用 IPv4 iptables NAT REDIRECT；若系统使用 nftables 或仅 IPv6，请按需修改。
+# 项目：Sing-box 全能自动化部署系统（HY2 UDP-only，改进版 - 小修改）
+# 说明：在之前提交的基础上做小且可回滚的改动：
+#  - 创建日志文件并设置安全权限，所有输出追加到日志（同时保留终端输出）
+#  - 在添加 iptables 规则时附加注释标签，便于精确清理
+#  - 在中断/错误时触发 on_exit 清理函数，移除添加的 iptables 规则
+#  - 读取 Cloudflare Token 时使用静默输入（read -s）避免回显
+# 其它逻辑不变，变动极小，易回滚。
 # =================================================================
 
 set -euo pipefail
@@ -19,12 +20,46 @@ RANDOM_PORT="${RANDOM_PORT:-$(shuf -i 10000-60000 -n 1)}"   # Reality handshake 
 HY2_PORT="${HY2_PORT:-5443}"                               # HY2 实际监听端口（非 443），脚本会把 UDP:443 转发到此端口
 UUID="${UUID:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)}"
 LOGFILE="${LOGFILE:-/var/log/singbox-deploy.log}"
+REDIRECT_TAG="${REDIRECT_TAG:-zxjsingbox-redirect}"
 
 RED='\033[0;31m' && GREEN='\033[0;32m' && YELLOW='\033[0;33m' && NC='\033[0m'
 
-log() { echo -e "[$(date '+%F %T')] $*" | tee -a "$LOGFILE"; }
+# Ensure logfile exists and has secure permissions (minimal change)
+mkdir -p "$(dirname "$LOGFILE")"
+touch "$LOGFILE"
+chmod 0640 "$LOGFILE"
 
-trap 'rc=$?; if [ $rc -ne 0 ]; then echo -e "${RED}错误退出，查看日志 $LOGFILE${NC}"; journalctl -u sing-box --no-pager -n 80 || true; nginx -t || true; exit $rc; fi' ERR
+# Redirect all stdout/stderr to logfile as well as terminal
+exec > >(tee -a "$LOGFILE") 2>&1
+
+log() { echo -e "[$(date '+%F %T')] $*"; }
+
+# on_exit handler: remove iptables redirect added by this script
+on_exit() {
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    log "${RED}非正常退出 (code=$rc)，尝试清理并退出...${NC}"
+  else
+    log "退出，开始清理..."
+  fi
+  # Attempt to remove rules that contain our redirect tag
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "$REDIRECT_TAG" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+      iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "$REDIRECT_TAG" | while read -r line; do
+        # convert -A to -D for deletion
+        delline="${line/-A/-D}"
+        # run delete command
+        iptables -t nat $delline 2>/dev/null || true
+      done
+      log "已移除带标记的 iptables 规则 ($REDIRECT_TAG)"
+    fi
+  fi
+  exit $rc
+}
+
+# trap INT, TERM and ERR to ensure cleanup on interruption or error
+trap on_exit INT TERM ERR
 
 # ---------------- 基础前置检查 ----------------
 if [ "$(id -u)" -ne 0 ]; then
@@ -78,7 +113,9 @@ issue_certificate() {
     # 支持 Cloudflare (dns_cf)。需提供 CF_Token（推荐）
     if [ -z "${CF_TOKEN:-}" ]; then
       log "使用 DNS 模式申请证书（Cloudflare）。请提供 Cloudflare API Token（拥有 Zone:Edit 权限）"
-      read -rp "请输入 Cloudflare API Token（粘贴后回车）： " CF_TOKEN_INPUT
+      # read silently to avoid echoing token
+      read -rs -p "请输入 Cloudflare API Token（粘贴后回车）： " CF_TOKEN_INPUT
+      echo
       CF_TOKEN="${CF_TOKEN_INPUT:-$CF_TOKEN}"
     fi
     if [ -z "${CF_TOKEN:-}" ]; then
@@ -158,18 +195,25 @@ setup_udp443_redirect() {
     log "${YELLOW}警告：iptables 未找到，无法添加 UDP 443 重定向规则。请手动配置或安装 iptables${NC}"
     return 0
   fi
-  log "配置 iptables：将 UDP 443 重定向到本机 UDP ${HY2_PORT}"
+  log "配置 iptables：将 UDP 443 重定向到本机 UDP ${HY2_PORT}（带标记: $REDIRECT_TAG）"
   # 先尝试删除旧规则（若存在），防止重复添加（忽略错误）
-  iptables -t nat -D PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}" 2>/dev/null || true
-  iptables -t nat -A PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}"
+  iptables -t nat -D PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}" -m comment --comment "$REDIRECT_TAG" 2>/dev/null || true
+  iptables -t nat -A PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}" -m comment --comment "$REDIRECT_TAG"
   log "iptables 规则已添加（IPv4 UDP 443 -> ${HY2_PORT}）"
   log "注意：iptables 规则不会自动持久化，重启后会失效。可安装 iptables-persistent 或将规则写入启动脚本以持久化。"
 }
 
 remove_udp443_redirect() {
-  if command -v iptables >/dev/null 2>&1; then
-    iptables -t nat -D PREROUTING -p udp --dport 443 -j REDIRECT --to-ports "${HY2_PORT}" 2>/dev/null || true
+  # Remove rules that contain our redirect tag
+  if ! command -v iptables >/dev/null 2>&1; then
+    return 0
   fi
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "$REDIRECT_TAG" >/dev/null 2>&1 || return 0
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "$REDIRECT_TAG" | while read -r line; do
+    delline="${line/-A/-D}"
+    iptables -t nat $delline 2>/dev/null || true
+  done
+  log "已尝试移除带标记的 iptables 规则 ($REDIRECT_TAG)"
 }
 
 deploy_singbox() {
@@ -275,7 +319,7 @@ rollback() {
 
 # ---------------- 主流程交互 ----------------
 clear
-echo -e "${GREEN}Sing-box 自动化部署（HY2 UDP-only 版，改进）${NC}"
+echo -e "${GREEN}Sing-box 自动化部署（HY2 UDP-only 版，改进 - 小修改）${NC}"
 echo "运行日志：$LOGFILE"
 echo
 
@@ -315,7 +359,9 @@ if [ "$CERT_MODE" = "2" ]; then
   if [ -z "${CF_TOKEN:-}" ]; then
     echo
     echo "使用 Cloudflare DNS 方式申请证书需要 API Token（拥有 Zone:Edit 权限）。"
-    read -rp "请输入 Cloudflare API Token（粘贴后回车，或回车跳过并用 HTTP 模式）: " CF_TOKEN_INPUT
+    # read token silently to avoid echoing
+    read -rs -p "请输入 Cloudflare API Token（粘贴后回��，或回车跳过并用 HTTP 模式）: " CF_TOKEN_INPUT
+    echo
     if [ -n "$CF_TOKEN_INPUT" ]; then
       export CF_Token="$CF_TOKEN_INPUT"
       CF_TOKEN="$CF_TOKEN_INPUT"
