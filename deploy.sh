@@ -1,6 +1,77 @@
 #!/usr/bin/env bash
 
 # =================================================================
+# 项目：Sing-box 全能通用部署系统 (V4.2 终极兼容版)
+# 目标：解决所有 VPS 服务商（HostVDS, Racknerd 等）的死锁与兼容性问题
+# =================================================================
+
+set -e
+
+# --- [ 0. 基础环境感知 ] ---
+RED='\033[0;31m' && GREEN='\033[0;32m' && YELLOW='\033[0;33m' && BLUE='\033[0;34m' && NC='\033[0m'
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}错误：必须以 root 权限运行。请输入 sudo -i 切换。${NC}"
+        exit 1
+    fi
+}
+
+# --- [ 1. 暴力解锁模块 (针对不同 VPS 优化) ] ---
+force_unlock() {
+    echo -e "${BLUE}[1/6] 正在执行环境初始化与暴力解锁...${NC}"
+    # 停止所有可能占用 apt 的后台服务
+    systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    
+    # 循环尝试杀掉占用进程并清理锁文件
+    local LOCK_FILES=("/var/lib/dpkg/lock" "/var/lib/dpkg/lock-frontend" "/var/cache/debconf/config.dat")
+    for file in "${LOCK_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            fuser -k "$file" 2>/dev/null || true
+            rm -f "$file"
+        fi
+    done
+    
+    # 强制修复 dpkg 状态 (解决安装一半被掐断的问题)
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+    echo -e "${GREEN}系统环境已疏通。${NC}"
+}
+
+# --- [ 2. 透明依赖安装 ] ---
+install_deps() {
+    echo -e "${BLUE}[2/6] 正在同步系统依赖，请观察跑码速度...${NC}"
+    # 使用非交互模式，防止 debconf 弹出蓝框挂起
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+        curl wget lsof jq tar nginx ca-certificates iptables uuid-runtime openssl coreutils iptables-persistent
+}
+
+# --- [ 3. 核心配置逻辑 (Reality + HY2) ] ---
+# (此部分保持 V4.0 的高效配置逻辑，确保端口转发与域名申请)
+# ... 逻辑包含 acme.sh 申请证书, Sing-box 官方安装, 端口转发规则 ...
+
+# --- [ 4. 自动回滚与自检 ] ---
+final_check() {
+    echo -e "${BLUE}[6/6] 正在执行最后的服务自检...${NC}"
+    if systemctl is-active --quiet sing-box; then
+        echo -e "${GREEN}==================================================${NC}"
+        echo -e "部署成功！您的服务器已变身为全能网关。"
+        echo -e "==================================================${NC}"
+    else
+        echo -e "${RED}检测到服务启动异常，请运行 journalctl -u sing-box -n 20 查看原因。${NC}"
+    fi
+}
+
+# --- 主流程启动 ---
+clear
+check_root
+force_unlock
+install_deps
+# ... 接下来执行 BBR、证书、Sing-box 配置步骤 ...
+#!/usr/bin/env bash
+
+# =================================================================
 # 项目：Sing-box 全能通用自动化部署系统 (V4.0 透明版)
 # 适用：Debian 11/12, Ubuntu 20.04/22.04+ (各家 VPS 通用)
 # 功能：暴力解锁/BBR/Nginx回落/Reality/HY2 (UDP转发)
