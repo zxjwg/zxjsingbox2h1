@@ -1,0 +1,16 @@
+# 速度测试
+# curl -L https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py | python3 -
+
+# 经典简易测试：Bench.sh 最老牌、最简单的脚本，主要看服务器基础信息和全球几个大城市的下载速度
+
+# wget -qO- bench.sh | bash
+
+# 这是目前最流行的脚本，不仅测网速，还会测试 CPU 性能（跑分）和 磁盘 IO（读写速度）
+
+# wget -qO- yabs.sh | bash
+
+# 对于使用 Sing-box 的用户来说，这个脚本最重要。它专门测试服务器连接到中国电信、联通、移动三大运营商各个省份节点的网速
+
+# bash <(curl -Lso- https://bench.im/hyperspeed)
+
+
