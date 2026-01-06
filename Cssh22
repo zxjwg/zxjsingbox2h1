@@ -1,0 +1,59 @@
+cat << 'EOF' > change_ssh_port.sh
+#!/bin/bash
+
+# 检查是否为 root 用户
+if [ "$EUID" -ne 0 ]; then 
+  echo "请使用 root 用户运行此脚本（或使用 sudo）。"
+  exit 1
+fi
+
+# 获取用户输入的新端口
+read -p "请输入您想设置的新 SSH 端口号（建议 10000-65535）: " NEW_PORT
+
+# 检查输入是否为数字
+if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+  echo "错误：请输入 1 到 65535 之间的有效端口号。"
+  exit 1
+fi
+
+echo "正在将 SSH 端口修改为: $NEW_PORT ..."
+
+# 1. 备份原始配置文件
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+echo "已备份原配置文件到 /etc/ssh/sshd_config.bak"
+
+# 2. 使用 sed 修改 Port 行
+# 兼容处理有注释 (#Port 22) 和无注释 (Port 22) 的情况
+if grep -q "^Port" /etc/ssh/sshd_config; then
+    sed -i "s/^Port [0-9]*/Port $NEW_PORT/g" /etc/ssh/sshd_config
+elif grep -q "^#Port" /etc/ssh/sshd_config; then
+    sed -i "s/^#Port [0-9]*/Port $NEW_PORT/g" /etc/ssh/sshd_config
+else
+    echo "Port $NEW_PORT" >> /etc/ssh/sshd_config
+fi
+
+# 3. 如果系统安装了 UFW 防火墙，自动放行新端口
+if command -v ufw >/dev/null 2>&1; then
+    echo "检测到 UFW，正在放行新端口 $NEW_PORT ..."
+    ufw allow $NEW_PORT/tcp
+fi
+
+# 4. 重启 SSH 服务
+systemctl restart ssh
+
+if [ $? -eq 0 ]; then
+    echo "------------------------------------------------"
+    echo "修改成功！SSH 端口现已变更为: $NEW_PORT"
+    echo "请务必在 HostVDS 后台防火墙（Security Group）中开放 TCP $NEW_PORT 端口。"
+    echo "在确认新端口能连上之前，请不要关闭当前的网页控制台窗口！"
+    echo "------------------------------------------------"
+else
+    echo "配置失败，正在还原备份..."
+    mv /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+    systemctl restart ssh
+fi
+EOF
+
+# 给脚本执行权限并运行
+chmod +x change_ssh_port.sh
+./change_ssh_port.sh
