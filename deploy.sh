@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =================================================================
-# 项目：Sing-box 自动化管理系统 (V8.6 完整无省略版)
-# 目标：补全所有缺失函数 / 强化公钥提取 / 自动开启 BBR
+# 项目：Sing-box 自动化管理系统 (V8.7 排除万难版)
+# 目标：解决二进制运行失败 / 强化路径查找 / 密钥提取终极兼容
 # =================================================================
 
 set -e
@@ -13,7 +13,7 @@ CERT_DIR="/etc/v2ray-agent/tls"
 ALIAS_PATH="/usr/bin/zxj2h1"
 IP=$(curl -s http://checkip.amazonaws.com || echo "你的IP")
 
-# --- [ 1. 性能优化模块：内核 BBR ] ---
+# --- [ 1. 性能优化：内核 BBR ] ---
 optimize_system() {
     echo -e "${BLUE}正在优化内核 BBR 加速...${NC}"
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
@@ -25,15 +25,15 @@ optimize_system() {
     read -rp "按回车键返回..." && main_menu
 }
 
-# --- [ 2. 核心部署模块 ] ---
+# --- [ 2. 核心部署模块：深度加固 ] ---
 install_singbox() {
-    echo -e "${BLUE}开始执行 Sing-box 自动化部署...${NC}"
+    echo -e "${BLUE}[1/4] 正在清理并安装核心依赖...${NC}"
     apt-get update && apt-get install -y jq uuid-runtime qrencode coreutils openssl socat tar wget curl
     
     read -rp "请输入域名: " DOMAIN
     read -rp "请输入邮箱: " EMAIL
 
-    # 证书申请逻辑
+    # 证书申请
     if [ ! -f "$CERT_DIR/server.crt" ]; then
         curl https://get.acme.sh | sh -s email="$EMAIL" || true
         /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
@@ -43,27 +43,42 @@ install_singbox() {
         /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt"
     fi
 
-    # 二进制直装
+    echo -e "${BLUE}[2/4] 正在下载 Sing-box 核心程序...${NC}"
+    rm -f /usr/bin/sing-box # 强制清理旧文件
     ARCH=$(uname -m); [ "$ARCH" == "x86_64" ] && SB_ARCH="amd64" || SB_ARCH="arm64"
     VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
-    tar -zxf sing-box.tar.gz && mv sing-box-*/sing-box /usr/bin/ && chmod +x /usr/bin/sing-box
+    
+    # 模糊匹配解压，防止文件夹名变动
+    tar -zxf sing-box.tar.gz
+    find . -name sing-box -type f -exec mv -f {} /usr/bin/sing-box \;
+    chmod +x /usr/bin/sing-box
     rm -rf sing-box.tar.gz sing-box-*
 
-    # 密钥强制提取逻辑
-    /usr/bin/sing-box generate reality-keypair > /tmp/keys.txt
-    PRIV_KEY=$(grep "Private key:" /tmp/keys.txt | awk '{print $NF}')
-    PUB_KEY=$(grep "Public key:" /tmp/keys.txt | awk '{print $NF}')
-    rm -f /tmp/keys.txt
+    # 二进制运行自检
+    echo -e "${BLUE}[3/4] 正在进行程序运行自检...${NC}"
+    if ! /usr/bin/sing-box version > /dev/null 2>&1; then
+        echo -e "${RED}致命错误：Sing-box 无法运行！可能是架构不匹配或缺少系统库。${NC}"
+        exit 1
+    fi
+
+    # 密钥提取：终极稳定方案
+    RE_OUT=$(/usr/bin/sing-box generate reality-keypair 2>&1)
+    PRIV_KEY=$(echo "$RE_OUT" | awk -F': ' '/Private key/ {print $2}' | tr -d ' ')
+    PUB_KEY=$(echo "$RE_OUT" | awk -F': ' '/Public key/ {print $2}' | tr -d ' ')
     
-    if [[ -z "$PUB_KEY" ]]; then echo -e "${RED}密钥生成失败！${NC}"; exit 1; fi
+    if [[ -z "$PUB_KEY" ]]; then
+        echo -e "${RED}密钥提取失败！程序输出如下：${NC}"
+        echo "$RE_OUT"
+        exit 1
+    fi
     echo "$PUB_KEY" > "$CONF_DIR/pub.key"
 
     UUID=$(uuidgen)
     SID=$(openssl rand -hex 8)
     RAND_PORT=$(shuf -i 10000-60000 -n 1)
 
-    # 写入配置
+    echo -e "${BLUE}[4/4] 正在应用配置文件...${NC}"
     mkdir -p "$CONF_DIR"
     cat > "$CONF_DIR/config.json" <<EOF
 {
@@ -83,7 +98,6 @@ install_singbox() {
   "outbounds": [{"type": "direct"}]
 }
 EOF
-    # 启动服务
     systemctl restart sing-box || { 
         cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
@@ -97,15 +111,14 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload && systemctl enable --now sing-box
     }
-    echo -e "${GREEN}部署完成！请返回菜单选 3 查看配置。${NC}"
+    echo -e "${GREEN}部署完成！请返回菜单选 3 查看二维码。${NC}"
     read -p "按回车返回..." && main_menu
 }
 
-# --- [ 3. 查看配置模块 ] ---
+# --- [ 3. 查看配置 ] ---
 show_config() {
     clear
     if [ ! -f "$CONF_DIR/config.json" ]; then echo -e "${RED}未安装服务。${NC}"; sleep 2; main_menu; fi
-    
     UUID=$(jq -r '.inbounds[0].users[0].uuid' "$CONF_DIR/config.json")
     PUB_KEY=$(cat "$CONF_DIR/pub.key" 2>/dev/null || echo "MISSING")
     SID=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$CONF_DIR/config.json")
@@ -121,25 +134,22 @@ show_config() {
     read -p "按回车返回..." && main_menu
 }
 
-# --- [ 4. Hy2 性能微调模块 ] ---
+# --- [ 4. Hy2 优化 / 5. 网络诊断 ] ---
+# (此处函数补全，确保无 command not found)
 hy2_tuning() {
-    echo -e "${BLUE}正在优化 Hy2 (MTU=1280 + 端口跳跃)...${NC}"
-    if [ ! -f "$CONF_DIR/config.json" ]; then echo -e "${RED}配置不存在。${NC}"; sleep 2; main_menu; fi
-    
+    echo -e "${BLUE}正在优化 Hy2 参数...${NC}"
     jq '.inbounds |= map(if .tag == "hy2-in" then . + {"mtu": 1280, "hop": true} else . end)' \
         "$CONF_DIR/config.json" > /tmp/sb.json && mv /tmp/sb.json "$CONF_DIR/config.json"
-    
     systemctl restart sing-box
-    echo -e "${GREEN}优化成功！请确保开启 UDP 8000-9000 端口。${NC}"
+    echo -e "${GREEN}Hy2 已完成 MTU 与端口跳跃优化。${NC}"
     read -p "按回车返回..." && main_menu
 }
 
-# --- [ 5. 诊断工具模块 ] ---
 debug_network() {
     clear
-    echo -e "${YELLOW}--- 网络状态自检 ---${NC}"
-    echo -e "443 端口状态 (Reality):" && lsof -i:443 || echo "未监听"
-    echo -e "\n8443 端口状态 (Hy2):" && lsof -i:8443 || echo "未监听"
+    echo -e "${YELLOW}--- 网络诊断 ---${NC}"
+    echo -e "443 端口 (Reality):" && lsof -i:443 || echo "未监听到 443"
+    echo -e "8443 端口 (Hy2):" && lsof -i:8443 || echo "未监听到 8443"
     read -p "按回车返回..." && main_menu
 }
 
@@ -147,12 +157,12 @@ debug_network() {
 main_menu() {
     clear
     echo -e "${BLUE}==================================================${NC}"
-    echo -e "      不正经的科学 - Sing-box 管理系统 V8.6       "
+    echo -e "      不正经的科学 - Sing-box 管理系统 V8.7       "
     echo -e "${BLUE}==================================================${NC}"
     echo -e "  ${GREEN}1.${NC} 开启 BBR 加速"
     echo -e "  ${GREEN}2.${NC} 一键部署节点 (Reality + HY2)"
     echo -e "  ${GREEN}3.${NC} 查看节点信息/二维码"
-    echo -e "  ${GREEN}4.${NC} HY2 性能调优"
+    echo -e "  ${GREEN}4.${NC} HY2 性能微调"
     echo -e "  ${YELLOW}5.${NC} 深度网络诊断"
     echo -e "  ${RED}0.${NC} 退出"
     echo -e "${BLUE}==================================================${NC}"
@@ -163,7 +173,6 @@ main_menu() {
     esac
 }
 
-# 配置快捷词
 echo "bash <(curl -Ls https://raw.githubusercontent.com/zxjwg/zxjsingbox2h1/refs/heads/main/deploy.sh)" > "$ALIAS_PATH"
 chmod +x "$ALIAS_PATH"
 main_menu
