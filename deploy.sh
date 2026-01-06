@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =================================================================
-# 项目：Sing-box 自动化管理系统 (V8.7 排除万难版)
-# 目标：解决二进制运行失败 / 强化路径查找 / 密钥提取终极兼容
+# 项目：Sing-box 自动化管理系统 (V8.8 终极兼容版)
+# 修复：解决 PrivateKey 无空格提取失败 / 补全所有模块
 # =================================================================
 
 set -e
@@ -13,7 +13,7 @@ CERT_DIR="/etc/v2ray-agent/tls"
 ALIAS_PATH="/usr/bin/zxj2h1"
 IP=$(curl -s http://checkip.amazonaws.com || echo "你的IP")
 
-# --- [ 1. 性能优化：内核 BBR ] ---
+# --- [ 1. 性能优化模块 ] ---
 optimize_system() {
     echo -e "${BLUE}正在优化内核 BBR 加速...${NC}"
     if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
@@ -25,9 +25,9 @@ optimize_system() {
     read -rp "按回车键返回..." && main_menu
 }
 
-# --- [ 2. 核心部署模块：深度加固 ] ---
+# --- [ 2. 核心部署模块 ] ---
 install_singbox() {
-    echo -e "${BLUE}[1/4] 正在清理并安装核心依赖...${NC}"
+    echo -e "${BLUE}[1/4] 安装依赖...${NC}"
     apt-get update && apt-get install -y jq uuid-runtime qrencode coreutils openssl socat tar wget curl
     
     read -rp "请输入域名: " DOMAIN
@@ -43,43 +43,30 @@ install_singbox() {
         /root/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --key-file "$CERT_DIR/server.key" --fullchain-file "$CERT_DIR/server.crt"
     fi
 
-    echo -e "${BLUE}[2/4] 正在下载 Sing-box 核心程序...${NC}"
-    rm -f /usr/bin/sing-box # 强制清理旧文件
+    echo -e "${BLUE}[2/4] 下载 Sing-box...${NC}"
+    rm -f /usr/bin/sing-box
     ARCH=$(uname -m); [ "$ARCH" == "x86_64" ] && SB_ARCH="amd64" || SB_ARCH="arm64"
     VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     wget -qO sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
-    
-    # 模糊匹配解压，防止文件夹名变动
-    tar -zxf sing-box.tar.gz
-    find . -name sing-box -type f -exec mv -f {} /usr/bin/sing-box \;
-    chmod +x /usr/bin/sing-box
-    rm -rf sing-box.tar.gz sing-box-*
+    tar -zxf sing-box.tar.gz && find . -name sing-box -type f -exec mv -f {} /usr/bin/sing-box \;
+    chmod +x /usr/bin/sing-box && rm -rf sing-box.tar.gz sing-box-*
 
-    # 二进制运行自检
-    echo -e "${BLUE}[3/4] 正在进行程序运行自检...${NC}"
-    if ! /usr/bin/sing-box version > /dev/null 2>&1; then
-        echo -e "${RED}致命错误：Sing-box 无法运行！可能是架构不匹配或缺少系统库。${NC}"
-        exit 1
-    fi
-
-    # 密钥提取：终极稳定方案
-    RE_OUT=$(/usr/bin/sing-box generate reality-keypair 2>&1)
-    PRIV_KEY=$(echo "$RE_OUT" | awk -F': ' '/Private key/ {print $2}' | tr -d ' ')
-    PUB_KEY=$(echo "$RE_OUT" | awk -F': ' '/Public key/ {print $2}' | tr -d ' ')
+    # --- 修复：兼容 PrivateKey 和 Private key 两种输出格式 ---
+    echo -e "${BLUE}[3/4] 提取 Reality 密钥...${NC}"
+    RE_OUT=$(/usr/bin/sing-box generate reality-keypair)
+    # 使用 awk 直接打印每行最后一个字段，无视前面是否有空格或冒号
+    PRIV_KEY=$(echo "$RE_OUT" | awk '/Private/ {print $NF}')
+    PUB_KEY=$(echo "$RE_OUT" | awk '/Public/ {print $NF}')
     
-    if [[ -z "$PUB_KEY" ]]; then
-        echo -e "${RED}密钥提取失败！程序输出如下：${NC}"
-        echo "$RE_OUT"
-        exit 1
-    fi
+    if [[ -z "$PUB_KEY" ]]; then echo -e "${RED}提取失败！输出为：$RE_OUT${NC}"; exit 1; fi
+    mkdir -p "$CONF_DIR"
     echo "$PUB_KEY" > "$CONF_DIR/pub.key"
 
     UUID=$(uuidgen)
     SID=$(openssl rand -hex 8)
     RAND_PORT=$(shuf -i 10000-60000 -n 1)
 
-    echo -e "${BLUE}[4/4] 正在应用配置文件...${NC}"
-    mkdir -p "$CONF_DIR"
+    echo -e "${BLUE}[4/4] 写入配置...${NC}"
     cat > "$CONF_DIR/config.json" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
@@ -98,6 +85,7 @@ install_singbox() {
   "outbounds": [{"type": "direct"}]
 }
 EOF
+    # 启动服务
     systemctl restart sing-box || { 
         cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
@@ -111,45 +99,42 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload && systemctl enable --now sing-box
     }
-    echo -e "${GREEN}部署完成！请返回菜单选 3 查看二维码。${NC}"
+    echo -e "${GREEN}部署完成！请返回菜单选 3 查看。${NC}"
     read -p "按回车返回..." && main_menu
 }
 
 # --- [ 3. 查看配置 ] ---
 show_config() {
     clear
-    if [ ! -f "$CONF_DIR/config.json" ]; then echo -e "${RED}未安装服务。${NC}"; sleep 2; main_menu; fi
+    if [ ! -f "$CONF_DIR/config.json" ]; then echo -e "${RED}未安装。${NC}"; sleep 2; main_menu; fi
     UUID=$(jq -r '.inbounds[0].users[0].uuid' "$CONF_DIR/config.json")
     PUB_KEY=$(cat "$CONF_DIR/pub.key" 2>/dev/null || echo "MISSING")
     SID=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$CONF_DIR/config.json")
     DOMAIN=$(jq -r '.inbounds[1].tls.server_name' "$CONF_DIR/config.json")
-    
     VLESS="vless://$UUID@$IP:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=$PUB_KEY&sid=$SID#Reality_$IP"
     HY2="hysteria2://$UUID@$IP:8443?sni=$DOMAIN&alpn=h3&insecure=0#HY2_$IP"
-
-    echo -e "${YELLOW}Reality 节点:${NC}\n${BLUE}$VLESS${NC}"
+    echo -e "${YELLOW}Reality:${NC}\n${BLUE}$VLESS${NC}"
     qrencode -t UTF8 "$VLESS"
-    echo -e "\n${YELLOW}Hysteria 2 节点:${NC}\n${BLUE}$HY2${NC}"
+    echo -e "\n${YELLOW}Hy2:${NC}\n${BLUE}$HY2${NC}"
     qrencode -t UTF8 "$HY2"
     read -p "按回车返回..." && main_menu
 }
 
-# --- [ 4. Hy2 优化 / 5. 网络诊断 ] ---
-# (此处函数补全，确保无 command not found)
+# --- [ 4. Hy2 优化 ] ---
 hy2_tuning() {
-    echo -e "${BLUE}正在优化 Hy2 参数...${NC}"
+    echo -e "${BLUE}优化 Hy2...${NC}"
     jq '.inbounds |= map(if .tag == "hy2-in" then . + {"mtu": 1280, "hop": true} else . end)' \
         "$CONF_DIR/config.json" > /tmp/sb.json && mv /tmp/sb.json "$CONF_DIR/config.json"
     systemctl restart sing-box
-    echo -e "${GREEN}Hy2 已完成 MTU 与端口跳跃优化。${NC}"
+    echo -e "${GREEN}完成！放行 UDP 8000-9000 端口。${NC}"
     read -p "按回车返回..." && main_menu
 }
 
+# --- [ 5. 诊断 ] ---
 debug_network() {
     clear
-    echo -e "${YELLOW}--- 网络诊断 ---${NC}"
-    echo -e "443 端口 (Reality):" && lsof -i:443 || echo "未监听到 443"
-    echo -e "8443 端口 (Hy2):" && lsof -i:8443 || echo "未监听到 8443"
+    echo -e "${YELLOW}--- 网络状态 ---${NC}"
+    lsof -i:443 && lsof -i:8443 || echo "未监听"
     read -p "按回车返回..." && main_menu
 }
 
@@ -157,16 +142,16 @@ debug_network() {
 main_menu() {
     clear
     echo -e "${BLUE}==================================================${NC}"
-    echo -e "      不正经的科学 - Sing-box 管理系统 V8.7       "
+    echo -e "      不正经的科学 - Sing-box 管理系统 V8.8       "
     echo -e "${BLUE}==================================================${NC}"
     echo -e "  ${GREEN}1.${NC} 开启 BBR 加速"
     echo -e "  ${GREEN}2.${NC} 一键部署节点 (Reality + HY2)"
     echo -e "  ${GREEN}3.${NC} 查看节点信息/二维码"
-    echo -e "  ${GREEN}4.${NC} HY2 性能微调"
+    echo -e "  ${GREEN}4.${NC} HY2 性能调优"
     echo -e "  ${YELLOW}5.${NC} 深度网络诊断"
     echo -e "  ${RED}0.${NC} 退出"
     echo -e "${BLUE}==================================================${NC}"
-    read -rp "请选择 [0-5]: " num
+    read -rp "选择 [0-5]: " num
     case "$num" in
         1) optimize_system ;; 2) install_singbox ;; 3) show_config ;;
         4) hy2_tuning ;; 5) debug_network ;; 0) exit 0 ;; *) main_menu ;;
