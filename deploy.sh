@@ -437,7 +437,7 @@ EOF
   "inbounds": [
 $inbounds_json
   ],
-  "outbounds": [ { "type": "direct" } ]
+  "outbounds": [ { "type": "direct", "domain_strategy": "prefer_ipv4" } ]
 }
 EOF
     
@@ -537,7 +537,7 @@ EOF
   "inbounds": [
 $inbounds_json
   ],
-  "outbounds": [ { "type": "direct" } ]
+  "outbounds": [ { "type": "direct", "domain_strategy": "prefer_ipv4" } ]
 }
 EOF
     
