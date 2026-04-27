@@ -473,7 +473,7 @@ install_advanced() {
     
     setup_certificate "$DOMAIN" "$EMAIL" || {
         echo -e "${RED}证书申请与验证失败，无法继续${NC}"
-        sleep 3
+        read -rp "按回车键返回主菜单..."
         main_menu
         return
     }
