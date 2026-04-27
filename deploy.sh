@@ -4,8 +4,11 @@
 # 修复：防火墙持久化 / 错误处理 / 证书续期 / 配置备份
 # =================================================================
 
-set -e
-RED='\033[0;31m' && GREEN='\033[0;32m' && YELLOW='\033[0;33m' && BLUE='\033[0;34m' && NC='\033[0m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 CONF_DIR="/etc/sing-box"
 CERT_DIR="/etc/v2ray-agent/tls"
 BACKUP_DIR="$CONF_DIR/backups"
@@ -101,8 +104,10 @@ get_latest_version() {
 update_kernel_only() {
     echo -e "${BLUE}正在检查版本信息...${NC}"
     
-    local current_ver=$(get_current_version)
-    local latest_ver=$(get_latest_version) || return 1
+    local current_ver
+    current_ver=$(get_current_version)
+    local latest_ver
+    latest_ver=$(get_latest_version) || return 1
     
     echo -e "${YELLOW}当前版本: $current_ver${NC}"
     echo -e "${YELLOW}最新版本: $latest_ver${NC}"
@@ -239,12 +244,15 @@ setup_certificate() {
 
 # --- [ 6. 下载与服务模块 ] ---
 download_singbox() {
-    local latest_ver=$(get_latest_version) || return 1
-    local arch=$(uname -m)
+    local latest_ver
+    latest_ver=$(get_latest_version) || return 1
+    local arch
+    arch=$(uname -m)
+    local sb_arch
     case "$arch" in
-        x86_64) local sb_arch="amd64" ;;
-        aarch64|arm64) local sb_arch="arm64" ;;
-        armv7l) local sb_arch="armv7" ;;
+        x86_64) sb_arch="amd64" ;;
+        aarch64|arm64) sb_arch="arm64" ;;
+        armv7l) sb_arch="armv7" ;;
         *) echo -e "${RED}不支持的架构: $arch${NC}"; return 1 ;;
     esac
     
@@ -389,7 +397,7 @@ EOF
     
     # 准备 Hysteria2 (自签强密码)
     if [ "$proto_choice" == "2" ] || [ "$proto_choice" == "3" ]; then
-        local uuid_hy2=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+        local uuid_hy2=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 16)
         echo -e "${BLUE}正在为 HY2 生成隐蔽度极强的自签证书...${NC}"
         openssl req -x509 -nodes -newkey rsa:2048 -days 36500 \
             -keyout "$CONF_DIR/self.key" -out "$CONF_DIR/self.crt" \
@@ -443,7 +451,12 @@ install_advanced() {
     read -rp "请输入绑定本机的真实域名: " DOMAIN
     if [ -z "$DOMAIN" ]; then
         echo -e "${RED}域名不能为空${NC}"
-        sleep 2 && main_menu
+        sleep 2; main_menu
+        return
+    fi
+    if [[ ! "$DOMAIN" =~ \. ]]; then
+        echo -e "${RED}域名格式不正确（需包含.）${NC}"
+        sleep 2; main_menu
         return
     fi
     
@@ -493,7 +506,7 @@ install_advanced() {
 EOF
 )
     else
-        local uuid_hy2=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+        local uuid_hy2=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 16)
         inbounds_json=$(cat <<EOF
     {
       "type": "hysteria2",
@@ -537,11 +550,11 @@ check_service() {
     if systemctl is-active --quiet sing-box; then
         echo -e "${GREEN}✓ 服务状态: 运行中${NC}"
         echo -e "\n${YELLOW}进程信息:${NC}"
-        ps aux | grep sing-box | grep -v grep
+        ps aux | grep sing-box | grep -v grep || true
         
         echo -e "\n${YELLOW}监听端口:${NC}"
-        ss -tlnp | grep sing-box || echo "无TCP监听"
-        ss -ulnp | grep sing-box || echo "无UDP监听"
+        ss -tlnp | grep sing-box || echo "无TCP监听" || true
+        ss -ulnp | grep sing-box || echo "无UDP监听" || true
         
         echo -e "\n${YELLOW}最近日志:${NC}"
         journalctl -u sing-box --no-pager -n 10
@@ -619,7 +632,10 @@ show_config() {
     # ========== 解析输出 HY2 节点 ==========
     if [ -n "$hy2_idx" ]; then
         local uuid_hy2=$(jq -r ".inbounds[$hy2_idx].users[0].password" "$CONF_DIR/config.json")
-        local is_self_signed=$(jq -r ".inbounds[$hy2_idx].tls.certificate_path" "$CONF_DIR/config.json" | grep "self.crt" || echo "")
+        local cert_path
+        cert_path=$(jq -r ".inbounds[$hy2_idx].tls.certificate_path" "$CONF_DIR/config.json")
+        local is_self_signed=""
+        echo "$cert_path" | grep -q "self.crt" && is_self_signed="yes"
         local domain=$(jq -r ".inbounds[$hy2_idx].tls.server_name // empty" "$CONF_DIR/config.json")
         
         if [ -n "$is_self_signed" ] || [ -z "$domain" ]; then
@@ -654,10 +670,11 @@ show_config() {
 optimize_system() {
     echo -e "${BLUE}正在优化系统参数...${NC}"
     
-    if grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo -e "${YELLOW}BBR 已启用${NC}"
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        echo -e "${GREEN}✓ BBR 已经处于启用状态，无需重复配置${NC}"
     else
-        cat >> /etc/sysctl.conf <<EOF
+        # 仅在未配置时追加
+        grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf 2>/dev/null || cat >> /etc/sysctl.conf <<EOF
 
 # BBR 优化
 net.core.default_qdisc=fq
@@ -666,15 +683,14 @@ net.ipv4.tcp_fastopen=3
 net.core.rmem_max=134217728
 net.core.wmem_max=134217728
 EOF
-        sysctl -p
-        echo -e "${GREEN}BBR 优化完成${NC}"
-    fi
-    
-    # 验证
-    if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
-        echo -e "${GREEN}✓ BBR 已启用${NC}"
-    else
-        echo -e "${RED}✗ BBR 启用失败，可能需要内核支持${NC}"
+        sysctl -p 2>/dev/null || true
+        
+        # 验证
+        if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+            echo -e "${GREEN}✓ BBR 优化已成功启用${NC}"
+        else
+            echo -e "${RED}✗ BBR 启用失败，可能需要更新内核${NC}"
+        fi
     fi
     
     sleep 2
@@ -747,7 +763,7 @@ main_menu() {
         3) show_config ;;
         4) update_kernel_only ;;
         5) check_service ;;
-        6) systemctl restart sing-box && echo -e "${GREEN}服务已重启${NC}" && sleep 1 && main_menu ;;
+        6) if systemctl restart sing-box 2>/dev/null; then echo -e "${GREEN}服务已重启${NC}"; else echo -e "${RED}重启失败，请先部署节点${NC}"; fi; sleep 1; main_menu ;;
         7) journalctl -u sing-box -f ;;
         8) uninstall_singbox ;;
         0) echo -e "${GREEN}感谢使用！${NC}" && exit 0 ;;
