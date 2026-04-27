@@ -212,16 +212,12 @@ setup_certificate() {
     # 设置默认 CA 并申请证书
     /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
     
-    # 停止可能占用 80 端口的服务并强杀残余进程
-    systemctl stop sing-box 2>/dev/null || true
-    echo -e "${BLUE}释放 80 端口以申请证书...${NC}"
-    if command -v lsof &>/dev/null; then
-        lsof -i :80 -t | xargs kill -9 2>/dev/null || true
-    elif command -v fuser &>/dev/null; then
-        fuser -k 80/tcp 2>/dev/null || true
-    fi
+    echo -e "${BLUE}申请证书中 (遇到 Nginx/Apache 将自动临时挂起以释放 80 端口)...${NC}"
     
-    if /root/.acme.sh/acme.sh --issue -d "$domain" --standalone --force; then
+    # 使用 pre-hook 和 post-hook，保证申请时和未来自动续期时都能正确让出 80 端口
+    if /root/.acme.sh/acme.sh --issue -d "$domain" --standalone --force \
+        --pre-hook "systemctl stop nginx apache2 httpd sing-box 2>/dev/null || true" \
+        --post-hook "systemctl start nginx apache2 httpd 2>/dev/null || true"; then
         mkdir -p "$CERT_DIR"
         /root/.acme.sh/acme.sh --install-cert -d "$domain" \
             --key-file "$CERT_DIR/server.key" \
