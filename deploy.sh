@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =================================================================
-# 项目：Sing-box 自动化管理系统 (V9.9.2 深度修复版)
+# 项目：Sing-box 自动化管理系统 (V10.0 小白/折腾双模新架构)
 # 修复：防火墙持久化 / 错误处理 / 证书续期 / 配置备份
 # =================================================================
 
@@ -237,38 +237,8 @@ setup_certificate() {
     fi
 }
 
-# --- [ 6. 部署模块（优化版）] ---
-install_singbox() {
-    check_root
-    get_ip
-    safe_firewall
-    
-    echo -e "${BLUE}======================================${NC}"
-    echo -e "${BLUE}    开始部署 Sing-box 节点    ${NC}"
-    echo -e "${BLUE}======================================${NC}"
-    
-    # 输入域名和邮箱
-    read -rp "请输入域名: " DOMAIN
-    if [ -z "$DOMAIN" ]; then
-        echo -e "${RED}域名不能为空${NC}"
-        main_menu
-        return
-    fi
-    
-    read -rp "请输入邮箱: " EMAIL
-    EMAIL=${EMAIL:-admin@$DOMAIN}
-    
-    # 申请证书
-    setup_certificate "$DOMAIN" "$EMAIL" || {
-        echo -e "${RED}证书配置失败，无法继续${NC}"
-        sleep 3
-        main_menu
-        return
-    }
-    
-    # 安装 Sing-box
-    echo -e "${BLUE}正在安装 Sing-box 核心...${NC}"
-    
+# --- [ 6. 下载与服务模块 ] ---
+download_singbox() {
     local latest_ver=$(get_latest_version) || return 1
     local arch=$(uname -m)
     case "$arch" in
@@ -299,18 +269,74 @@ install_singbox() {
     mv -f "$binary" /usr/bin/sing-box
     chmod +x /usr/bin/sing-box
     cd - > /dev/null && rm -rf "$tmp_dir"
+    return 0
+}
+
+start_singbox_service() {
+    chmod 600 "$CONF_DIR/config.json"
     
-    # 生成配置
-    echo -e "${BLUE}正在生成配置文件...${NC}"
+    cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sing-box run -c $CONF_DIR/config.json
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
     
+    systemctl daemon-reload
+    systemctl enable sing-box
+    
+    if systemctl start sing-box; then
+        echo -e "${GREEN}部署完成！${NC}"
+        sleep 2
+        show_config
+    else
+        echo -e "${RED}服务启动失败，日志：${NC}"
+        journalctl -u sing-box --no-pager -n 20
+    fi
+}
+
+# --- [ 7. 一键部署入口 ] ---
+install_singbox() {
+    check_root
+    get_ip
+    safe_firewall
+    
+    clear
+    echo -e "${BLUE}======================================${NC}"
+    echo -e "${BLUE}    请选择部署模式    ${NC}"
+    echo -e "${BLUE}======================================${NC}"
+    echo -e "  ${GREEN}1.${NC} 小白一键部署 (无需域名, 自动生成 VLESS Reality + HY2 自签)"
+    echo -e "  ${YELLOW}2.${NC} 我要折腾 (需 Cloudflare 域名, 自动配 VLESS WS TLS + HY2 TLS)"
+    echo -e "${BLUE}======================================${NC}"
+    read -rp "请选择 [1-2, 默认1]: " deploy_mode
+    
+    if [ "$deploy_mode" == "2" ]; then
+        install_advanced
+    else
+        install_simple
+    fi
+}
+
+install_simple() {
+    echo -e "${BLUE}开始 [小白模式] 部署...${NC}"
+    
+    echo -e "${BLUE}正在安装 Sing-box 核心...${NC}"
+    download_singbox || return 1
+    
+    echo -e "${BLUE}正在生成自动配置...${NC}"
     local re_out=$(/usr/bin/sing-box generate reality-keypair)
     local priv_key=$(echo "$re_out" | awk '/PrivateKey/ {print $NF}' | tr -d '\r\n ')
     local pub_key=$(echo "$re_out" | awk '/PublicKey/ {print $NF}' | tr -d '\r\n ')
-    
-    if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
-        echo -e "${RED}Reality 密钥生成失败${NC}"
-        return 1
-    fi
     
     mkdir -p "$CONF_DIR"
     echo "$pub_key" > "$CONF_DIR/pub.key"
@@ -318,23 +344,13 @@ install_singbox() {
     local uuid_vless=$(uuidgen)
     local uuid_hy2=$(uuidgen)
     local sid=$(openssl rand -hex 8)
+    local sni_domain="www.bing.com"
     
-    # Reality 伪装域名选择
-    echo -e "\n${BLUE}请选择 Reality 伪装域名 (SNI):${NC}"
-    echo -e "  1. ${GREEN}www.bing.com${NC} (主选)"
-    echo -e "  2. ${GREEN}app.com${NC}"
-    echo -e "  3. ${GREEN}www.microsoft.com${NC}"
-    echo -e "  4. 自定义"
-    read -rp "请输入序号 [1-4, 默认1]: " sni_choice
-    case "$sni_choice" in
-        2) sni_domain="app.com" ;;
-        3) sni_domain="www.microsoft.com" ;;
-        4) read -rp "请输入自定义域名: " sni_domain ;;
-        *) sni_domain="www.bing.com" ;;
-    esac
-    sni_domain=${sni_domain:-www.bing.com}
+    echo -e "${BLUE}正在为 HY2 生成自签临时证书...${NC}"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 36500 \
+        -keyout "$CONF_DIR/self.key" -out "$CONF_DIR/self.crt" \
+        -subj "/C=US/ST=CA/L=Los Angeles/O=SingBox/CN=bing.com" 2>/dev/null
     
-    # 生成配置文件
     cat > "$CONF_DIR/config.json" <<EOF
 {
   "log": {
@@ -379,6 +395,97 @@ install_singbox() {
       ],
       "tls": {
         "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "$CONF_DIR/self.crt",
+        "key_path": "$CONF_DIR/self.key"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct"
+    }
+  ]
+}
+EOF
+    
+    start_singbox_service
+}
+
+install_advanced() {
+    echo -e "${BLUE}开始 [折腾模式] 部署...${NC}"
+    
+    read -rp "请输入绑定 Cloudflare 的真实域名: " DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo -e "${RED}域名不能为空${NC}"
+        sleep 2 && main_menu
+        return
+    fi
+    
+    read -rp "请输入邮箱用于申请证书: " EMAIL
+    EMAIL=${EMAIL:-admin@$DOMAIN}
+    
+    read -rp "请输入 VLESS WS 路径 (默认 /vless): " ws_path
+    ws_path=${ws_path:-/vless}
+    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
+    
+    setup_certificate "$DOMAIN" "$EMAIL" || {
+        echo -e "${RED}证书配置失败，无法继续${NC}"
+        sleep 3
+        main_menu
+        return
+    }
+    
+    echo -e "${BLUE}正在安装 Sing-box 核心...${NC}"
+    download_singbox || return 1
+    
+    echo -e "${BLUE}正在生成 WebSocket 大神配置...${NC}"
+    mkdir -p "$CONF_DIR"
+    local uuid_vless=$(uuidgen)
+    local uuid_hy2=$(uuidgen)
+    
+    cat > "$CONF_DIR/config.json" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-ws-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "$uuid_vless"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$DOMAIN",
+        "certificate_path": "$CERT_DIR/server.crt",
+        "key_path": "$CERT_DIR/server.key"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "$ws_path",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [
+        {
+          "password": "$uuid_hy2"
+        }
+      ],
+      "tls": {
+        "enabled": true,
         "server_name": "$DOMAIN",
         "alpn": ["h3"],
         "certificate_path": "$CERT_DIR/server.crt",
@@ -394,41 +501,10 @@ install_singbox() {
 }
 EOF
     
-    # 保护配置文件权限
-    chmod 600 "$CONF_DIR/config.json"
-    
-    # 创建 systemd 服务
-    cat > /etc/systemd/system/sing-box.service <<EOF
-[Unit]
-Description=sing-box service
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/sing-box run -c $CONF_DIR/config.json
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    systemctl daemon-reload
-    systemctl enable sing-box
-    
-    if systemctl start sing-box; then
-        echo -e "${GREEN}部署完成！${NC}"
-        sleep 2
-        show_config
-    else
-        echo -e "${RED}服务启动失败，日志：${NC}"
-        journalctl -u sing-box --no-pager -n 20
-    fi
+    start_singbox_service
 }
 
-# --- [ 7. 服务状态检查 ] ---
+# --- [ 8. 服务状态检查 ] ---
 check_service() {
     clear
     echo -e "${BLUE}======================================${NC}"
@@ -456,7 +532,7 @@ check_service() {
     read && main_menu
 }
 
-# --- [ 8. 展示配置 ] ---
+# --- [ 9. 展示配置 ] ---
 show_config() {
     clear
     echo -e "${BLUE}======================================${NC}"
@@ -472,26 +548,47 @@ show_config() {
     
     get_ip
     
+    local is_ws=$(jq -r '.inbounds[0].transport.type // empty' "$CONF_DIR/config.json")
     local uuid_vless=$(jq -r '.inbounds[0].users[0].uuid' "$CONF_DIR/config.json")
-    local pub_key=$(cat "$CONF_DIR/pub.key" 2>/dev/null || echo "未找到")
-    local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$CONF_DIR/config.json")
-    local sni=$(jq -r '.inbounds[0].tls.server_name' "$CONF_DIR/config.json")
-    local domain=$(jq -r '.inbounds[1].tls.server_name' "$CONF_DIR/config.json")
     local uuid_hy2=$(jq -r '.inbounds[1].users[0].password' "$CONF_DIR/config.json")
+    local vless_link=""
+    local hy2_link=""
     
-    # VLESS Reality 链接
-    local vless_link="vless://$uuid_vless@$IP:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pub_key&sid=$sid&type=tcp#Reality_${IP}"
-    
-    # Hysteria2 链接
-    local hy2_link="hysteria2://$uuid_hy2@$IP:8443?sni=$domain&alpn=h3&insecure=0#HY2_${IP}"
-    
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}VLESS Reality (TCP 443)${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "UUID: ${BLUE}$uuid_vless${NC}"
-    echo -e "链接: $vless_link"
-    echo ""
-    qrencode -t UTF8 "$vless_link"
+    if [ "$is_ws" == "ws" ]; then
+        # ==== 折腾模式：VLESS WS TLS ====
+        local domain=$(jq -r '.inbounds[0].tls.server_name' "$CONF_DIR/config.json")
+        local ws_path=$(jq -r '.inbounds[0].transport.path' "$CONF_DIR/config.json")
+        vless_link="vless://$uuid_vless@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&path=$(echo -n "$ws_path" | jq -sRr @uri)#VLESS_WS_${domain}"
+        hy2_link="hysteria2://$uuid_hy2@$domain:8443?sni=$domain&alpn=h3&insecure=0#HY2_${domain}"
+        
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${GREEN}VLESS + WebSocket + TLS (TCP 443)${NC}"
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "UUID: ${BLUE}$uuid_vless${NC}"
+        echo -e "域名: ${BLUE}$domain${NC}"
+        echo -e "路径 (Path): ${BLUE}$ws_path${NC}"
+        echo -e "链接: $vless_link"
+        echo ""
+        qrencode -t UTF8 "$vless_link"
+    else
+        # ==== 小白模式：VLESS Reality ====
+        local pub_key=$(cat "$CONF_DIR/pub.key" 2>/dev/null || echo "未找到")
+        local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$CONF_DIR/config.json")
+        local sni=$(jq -r '.inbounds[0].tls.server_name' "$CONF_DIR/config.json")
+        vless_link="vless://$uuid_vless@$IP:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pub_key&sid=$sid&type=tcp#Reality_${IP}"
+        
+        # HY2 自签
+        hy2_link="hysteria2://$uuid_hy2@$IP:8443?insecure=1#HY2_SelfSigned_${IP}"
+        
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${GREEN}VLESS Reality (TCP 443)${NC}"
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "UUID: ${BLUE}$uuid_vless${NC}"
+        echo -e "伪装SNI: ${BLUE}$sni${NC}"
+        echo -e "链接: $vless_link"
+        echo ""
+        qrencode -t UTF8 "$vless_link"
+    fi
     
     echo -e "\n${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}Hysteria2 (UDP 8443)${NC}"
@@ -581,7 +678,7 @@ uninstall_singbox() {
 main_menu() {
     clear
     echo -e "${BLUE}==================================================${NC}"
-    echo -e "      ${GREEN}Sing-box 管理系统${NC} ${YELLOW}(增强版 v9.9.2)${NC}      "
+    echo -e "      ${GREEN}Sing-box 管理系统${NC} ${YELLOW}(V10.0 小白/折腾双模新架构)${NC}      "
     echo -e "${BLUE}==================================================${NC}"
     echo -e "  ${GREEN}1.${NC} 开启 BBR 优化"
     echo -e "  ${GREEN}2.${NC} 一键部署节点 ${RED}(会覆盖现有配置)${NC}"
