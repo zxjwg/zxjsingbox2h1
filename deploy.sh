@@ -434,10 +434,11 @@ EOF
     cat > "$CONF_DIR/config.json" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
+  "dns": { "servers": [{"address": "1.1.1.1", "detour": "direct"}], "strategy": "prefer_ipv4" },
   "inbounds": [
 $inbounds_json
   ],
-  "outbounds": [ { "type": "direct", "domain_strategy": "prefer_ipv4" } ]
+  "outbounds": [ { "type": "direct" } ]
 }
 EOF
     
@@ -534,10 +535,11 @@ EOF
     cat > "$CONF_DIR/config.json" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
+  "dns": { "servers": [{"address": "1.1.1.1", "detour": "direct"}], "strategy": "prefer_ipv4" },
   "inbounds": [
 $inbounds_json
   ],
-  "outbounds": [ { "type": "direct", "domain_strategy": "prefer_ipv4" } ]
+  "outbounds": [ { "type": "direct" } ]
 }
 EOF
     
