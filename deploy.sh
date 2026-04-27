@@ -443,6 +443,10 @@ $inbounds_json
 EOF
     
     start_singbox_service
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}  部署完成！以下是您的节点信息：${NC}"
+    echo -e "${GREEN}========================================${NC}\n"
+    show_config
 }
 
 install_advanced() {
@@ -544,6 +548,10 @@ $inbounds_json
 EOF
     
     start_singbox_service
+    echo -e "\n${GREEN}========================================${NC}"
+    echo -e "${GREEN}  部署完成！以下是您的节点信息：${NC}"
+    echo -e "${GREEN}========================================${NC}\n"
+    show_config
 }
 
 # --- [ 8. 服务状态检查 ] ---
