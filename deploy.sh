@@ -617,7 +617,7 @@ show_config() {
             echo -e "绑定域名: ${BLUE}$domain${NC}"
             echo -e "伪装路径: ${BLUE}$ws_path${NC}"
             echo -e "\n直接导入链接:\n$vless_link\n"
-            qrencode -t UTF8 "$vless_link"
+            qrencode -m 2 -t ANSIUTF8 "$vless_link"
         else
             # 小白模式：VLESS Reality
             local pub_key=$(cat "$CONF_DIR/pub.key" 2>/dev/null || echo "")
@@ -631,7 +631,7 @@ show_config() {
             echo -e "UUID: ${BLUE}$uuid_vless${NC}"
             echo -e "伪装站点: ${BLUE}$sni${NC}"
             echo -e "\n直接导入链接:\n$vless_link\n"
-            qrencode -t UTF8 "$vless_link"
+            qrencode -m 2 -t ANSIUTF8 "$vless_link"
         fi
     fi
     
@@ -653,7 +653,7 @@ show_config() {
             echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
             echo -e "高强密码: ${BLUE}$uuid_hy2${NC}"
             echo -e "\n直接导入链接:\n$hy2_link\n"
-            qrencode -t UTF8 "$hy2_link"
+            qrencode -m 2 -t ANSIUTF8 "$hy2_link"
         else
             # 折腾模式域名 HY2
             local hy2_link="hysteria2://$uuid_hy2@$domain:8443?sni=$domain&alpn=h3&insecure=0#HY2_Domain_${domain}"
@@ -664,7 +664,7 @@ show_config() {
             echo -e "高强密码: ${BLUE}$uuid_hy2${NC}"
             echo -e "绑定域名: ${BLUE}$domain${NC}"
             echo -e "\n直接导入链接:\n$hy2_link\n"
-            qrencode -t UTF8 "$hy2_link"
+            qrencode -m 2 -t ANSIUTF8 "$hy2_link"
         fi
     fi
     
