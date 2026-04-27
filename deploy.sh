@@ -405,7 +405,7 @@ EOF
         echo -e "${BLUE}正在为 HY2 生成隐蔽度极强的自签证书...${NC}"
         openssl req -x509 -nodes -newkey rsa:2048 -days 36500 \
             -keyout "$CONF_DIR/self.key" -out "$CONF_DIR/self.crt" \
-            -subj "/C=US/ST=CA/L=Cupertino/O=Apple/OU=OS/CN=swdist.apple.com" 2>/dev/null
+            -subj "/C=US/ST=CA/L=Cupertino/O=Apple/OU=OS/CN=www.apple.com" 2>/dev/null
             
         hy2_json=$(cat <<EOF
     {
