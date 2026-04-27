@@ -434,7 +434,7 @@ EOF
     cat > "$CONF_DIR/config.json" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
-  "dns": { "servers": [{"tag": "local-dns", "type": "local", "detour": "direct"}], "strategy": "prefer_ipv4" },
+  "dns": { "servers": [{"tag": "google", "type": "udp", "server": "8.8.8.8", "server_port": 53}], "strategy": "prefer_ipv4" },
   "inbounds": [
 $inbounds_json
   ],
@@ -535,7 +535,7 @@ EOF
     cat > "$CONF_DIR/config.json" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
-  "dns": { "servers": [{"tag": "local-dns", "type": "local", "detour": "direct"}], "strategy": "prefer_ipv4" },
+  "dns": { "servers": [{"tag": "google", "type": "udp", "server": "8.8.8.8", "server_port": 53}], "strategy": "prefer_ipv4" },
   "inbounds": [
 $inbounds_json
   ],
