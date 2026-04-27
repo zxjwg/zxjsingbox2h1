@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =================================================================
-# 项目：Sing-box 自动化管理系统 (V9.9.0 安全增强版)
+# 项目：Sing-box 自动化管理系统 (V9.9.1 安全增强版)
 # 修复：防火墙持久化 / 错误处理 / 证书续期 / 配置备份
 # =================================================================
 
@@ -180,16 +180,19 @@ setup_certificate() {
     
     echo -e "${BLUE}正在配置 SSL 证书...${NC}"
     
-    # 检查证书是否已存在且有效
+    # 检查证书是否已存在、有效且域名匹配
     if [ -f "$CERT_DIR/server.crt" ]; then
+        local cert_domain=$(openssl x509 -noout -subject -in "$CERT_DIR/server.crt" | sed -n 's/.*CN = //p')
         local expire_date=$(openssl x509 -enddate -noout -in "$CERT_DIR/server.crt" | cut -d= -f2)
         local expire_epoch=$(date -d "$expire_date" +%s 2>/dev/null || echo 0)
         local now_epoch=$(date +%s)
         local days_left=$(( ($expire_epoch - $now_epoch) / 86400 ))
-        
-        if [ $days_left -gt 30 ]; then
-            echo -e "${GREEN}证书有效期剩余 $days_left 天，跳过申请${NC}"
+
+        if [[ "$cert_domain" == *"$domain"* ]] && [ $days_left -gt 30 ]; then
+            echo -e "${GREEN}证书域名匹配且有效期剩余 $days_left 天，跳过申请${NC}"
             return 0
+        elif [[ "$cert_domain" != *"$domain"* ]]; then
+            echo -e "${YELLOW}检测到域名已更换 ($cert_domain -> $domain)，强制重新申请...${NC}"
         else
             echo -e "${YELLOW}证书即将过期（剩余 $days_left 天），重新申请...${NC}"
         fi
@@ -312,9 +315,20 @@ install_singbox() {
     local uuid_hy2=$(uuidgen)
     local sid=$(openssl rand -hex 8)
     
-    # 允许自定义伪装域名
-    read -rp "Reality 伪装域名 [www.microsoft.com]: " sni_domain
-    sni_domain=${sni_domain:-www.microsoft.com}
+    # Reality 伪装域名选择
+    echo -e "\n${BLUE}请选择 Reality 伪装域名 (SNI):${NC}"
+    echo -e "  1. ${GREEN}www.bing.com${NC} (主选)"
+    echo -e "  2. ${GREEN}app.com${NC}"
+    echo -e "  3. ${GREEN}www.microsoft.com${NC}"
+    echo -e "  4. 自定义"
+    read -rp "请输入序号 [1-4, 默认1]: " sni_choice
+    case "$sni_choice" in
+        2) sni_domain="app.com" ;;
+        3) sni_domain="www.microsoft.com" ;;
+        4) read -rp "请输入自定义域名: " sni_domain ;;
+        *) sni_domain="www.bing.com" ;;
+    esac
+    sni_domain=${sni_domain:-www.bing.com}
     
     # 生成配置文件
     cat > "$CONF_DIR/config.json" <<EOF
@@ -550,7 +564,7 @@ uninstall_singbox() {
 main_menu() {
     clear
     echo -e "${BLUE}==================================================${NC}"
-    echo -e "      ${GREEN}Sing-box 管理系统${NC} ${YELLOW}(增强版 v9.9.0)${NC}      "
+    echo -e "      ${GREEN}Sing-box 管理系统${NC} ${YELLOW}(增强版 v9.9.1)${NC}      "
     echo -e "${BLUE}==================================================${NC}"
     echo -e "  ${GREEN}1.${NC} 开启 BBR 优化"
     echo -e "  ${GREEN}2.${NC} 一键部署节点 ${RED}(会覆盖现有配置)${NC}"
