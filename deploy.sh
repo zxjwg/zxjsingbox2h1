@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =================================================================
-# 项目：Sing-box 自动化管理系统 (V9.9.1 安全增强版)
+# 项目：Sing-box 自动化管理系统 (V9.9.2 深度修复版)
 # 修复：防火墙持久化 / 错误处理 / 证书续期 / 配置备份
 # =================================================================
 
@@ -182,19 +182,21 @@ setup_certificate() {
     
     # 检查证书是否已存在、有效且域名匹配
     if [ -f "$CERT_DIR/server.crt" ]; then
-        local cert_domain=$(openssl x509 -noout -subject -in "$CERT_DIR/server.crt" | sed -n 's/.*CN = //p')
         local expire_date=$(openssl x509 -enddate -noout -in "$CERT_DIR/server.crt" | cut -d= -f2)
         local expire_epoch=$(date -d "$expire_date" +%s 2>/dev/null || echo 0)
         local now_epoch=$(date +%s)
         local days_left=$(( ($expire_epoch - $now_epoch) / 86400 ))
 
-        if [[ "$cert_domain" == *"$domain"* ]] && [ $days_left -gt 30 ]; then
-            echo -e "${GREEN}证书域名匹配且有效期剩余 $days_left 天，跳过申请${NC}"
-            return 0
-        elif [[ "$cert_domain" != *"$domain"* ]]; then
-            echo -e "${YELLOW}检测到域名已更换 ($cert_domain -> $domain)，强制重新申请...${NC}"
+        # 使用全文匹配检查域名是否存在于当前证书（兼容由多域名造成的错判）
+        if openssl x509 -noout -text -in "$CERT_DIR/server.crt" | grep -q "$domain"; then
+            if [ $days_left -gt 30 ]; then
+                echo -e "${GREEN}检测到证书域名匹配($domain) 且有效期剩余 $days_left 天，跳过申请${NC}"
+                return 0
+            else
+                echo -e "${YELLOW}证书即将过期（剩余 $days_left 天），重新申请...${NC}"
+            fi
         else
-            echo -e "${YELLOW}证书即将过期（剩余 $days_left 天），重新申请...${NC}"
+            echo -e "${YELLOW}检测到域名已更换（当前证书中未找到 $domain），强制重新申请...${NC}"
         fi
     fi
     
@@ -210,8 +212,14 @@ setup_certificate() {
     # 设置默认 CA 并申请证书
     /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
     
-    # 停止可能占用 80 端口的服务
+    # 停止可能占用 80 端口的服务并强杀残余进程
     systemctl stop sing-box 2>/dev/null || true
+    echo -e "${BLUE}释放 80 端口以申请证书...${NC}"
+    if command -v lsof &>/dev/null; then
+        lsof -i :80 -t | xargs kill -9 2>/dev/null || true
+    elif command -v fuser &>/dev/null; then
+        fuser -k 80/tcp 2>/dev/null || true
+    fi
     
     if /root/.acme.sh/acme.sh --issue -d "$domain" --standalone --force; then
         mkdir -p "$CERT_DIR"
@@ -548,10 +556,23 @@ uninstall_singbox() {
     systemctl stop sing-box 2>/dev/null || true
     systemctl disable sing-box 2>/dev/null || true
     
-    # 删除文件
+    # 删除核心文件
     rm -f /etc/systemd/system/sing-box.service
     rm -f /usr/bin/sing-box
     rm -rf "$CONF_DIR"
+    
+    # 可选卸载 acme 和证书
+    read -rp "是否一并彻底删除 Acme.sh 和已申请的域名证书？(yes/no): " remove_cert
+    if [ "$remove_cert" == "yes" ]; then
+        if [ -f "/root/.acme.sh/acme.sh" ]; then
+            echo -e "${YELLOW}正在清理 acme.sh 和定时任务...${NC}"
+            /root/.acme.sh/acme.sh --uninstall >/dev/null 2>&1
+            rm -rf /root/.acme.sh
+        fi
+        echo -e "${YELLOW}清理旧证书文件...${NC}"
+        rm -rf /etc/v2ray-agent
+        echo -e "${GREEN}✓ 证书及 acme.sh 脚本已彻底清除！${NC}"
+    fi
     
     systemctl daemon-reload
     
@@ -564,7 +585,7 @@ uninstall_singbox() {
 main_menu() {
     clear
     echo -e "${BLUE}==================================================${NC}"
-    echo -e "      ${GREEN}Sing-box 管理系统${NC} ${YELLOW}(增强版 v9.9.1)${NC}      "
+    echo -e "      ${GREEN}Sing-box 管理系统${NC} ${YELLOW}(增强版 v9.9.2)${NC}      "
     echo -e "${BLUE}==================================================${NC}"
     echo -e "  ${GREEN}1.${NC} 开启 BBR 优化"
     echo -e "  ${GREEN}2.${NC} 一键部署节点 ${RED}(会覆盖现有配置)${NC}"
