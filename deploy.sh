@@ -357,16 +357,16 @@ install_simple() {
     # 准备 VLESS Reality
     if [ "$proto_choice" == "1" ] || [ "$proto_choice" == "3" ]; then
         echo -e "\n${BLUE}请选择 Reality 顶级伪装域名 (SNI):${NC}"
-        echo -e "  1. ${GREEN}swdist.apple.com${NC} (苹果官方分发，极速防封推荐)"
-        echo -e "  2. ${GREEN}www.bing.com${NC} (微软旧式)"
+        echo -e "  1. ${GREEN}www.microsoft.com${NC} (微软官方，有IPv4，极稳推荐)"
+        echo -e "  2. ${GREEN}addons.mozilla.org${NC} (Mozilla官方)"
         echo -e "  3. ${YELLOW}自定义输入${NC}"
         read -rp "请选择 [1-3, 默认1]: " sni_choice
         case "$sni_choice" in
-            2) sni_domain="www.bing.com" ;;
+            2) sni_domain="addons.mozilla.org" ;;
             3) read -rp "请输入自定义域名: " sni_domain ;;
-            *) sni_domain="swdist.apple.com" ;;
+            *) sni_domain="www.microsoft.com" ;;
         esac
-        sni_domain=${sni_domain:-swdist.apple.com}
+        sni_domain=${sni_domain:-www.microsoft.com}
         
         local re_out=$(/usr/bin/sing-box generate reality-keypair)
         local priv_key=$(echo "$re_out" | awk '/PrivateKey/ {print $NF}' | tr -d '\r\n ')
