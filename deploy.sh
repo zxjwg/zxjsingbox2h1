@@ -34,37 +34,41 @@ get_ip() {
 safe_firewall() {
     echo -e "${BLUE}正在优化防火墙规则...${NC}"
     
-    # 安装依赖
+    # 1. 安装基础依赖 (彻底剥离 iptables-persistent，加入无头模式防止 debconf 卡死弹窗)
     if command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y iptables iptables-persistent jq uuid-runtime qrencode openssl socat wget curl lsof &>/dev/null || {
-            echo -e "${RED}依赖安装失败${NC}"
-            exit 1
-        }
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -yq jq uuid-runtime qrencode openssl socat wget curl lsof iptables &>/dev/null || true
     elif command -v yum &>/dev/null; then
-        yum install -y iptables iptables-services jq util-linux qrencode openssl socat wget curl lsof &>/dev/null || {
-            echo -e "${RED}依赖安装失败${NC}"
-            exit 1
-        }
-    else
-        echo -e "${RED}不支持的系统${NC}"
-        exit 1
+        yum install -y jq util-linux qrencode openssl socat wget curl lsof iptables &>/dev/null || true
     fi
     
-    # 设置防火墙规则（保护SSH）
-    iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 22 -j ACCEPT
-    iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-    iptables -C INPUT -p udp --dport 8443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 8443 -j ACCEPT
-    iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT
-    
-    # 持久化规则
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save
-    elif command -v iptables-save &>/dev/null; then
-        iptables-save > /etc/sysconfig/iptables 2>/dev/null || \
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    # 2. 动态放开端口 (兼容各大厂商预设的防火墙体系：UFW / FirewallD / IPTables)
+    local ports=("80/tcp" "443/tcp" "8443/udp")
+
+    # 适配 UFW
+    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+        for port_proto in "${ports[@]}"; do
+            ufw allow "${port_proto}" >/dev/null 2>&1 || true
+        done
+    fi
+
+    # 适配 FirewallD
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
+        for port_proto in "${ports[@]}"; do
+            firewall-cmd --permanent --add-port="${port_proto}" >/dev/null 2>&1 || true
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
+    # 基础 iptables 兜底 (即使不持久化，也能确保本次运行连通)
+    if command -v iptables &>/dev/null; then
+        iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+        iptables -C INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+        iptables -C INPUT -p udp --dport 8443 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 8443 -j ACCEPT
     fi
     
-    echo -e "${GREEN}防火墙配置完成${NC}"
+    echo -e "${GREEN}防火墙规则优化完成${NC}"
 }
 
 # --- [ 2. 配置备份 ] ---
