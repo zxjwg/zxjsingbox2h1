@@ -315,8 +315,8 @@ install_singbox() {
     echo -e "${BLUE}======================================${NC}"
     echo -e "${BLUE}    请选择部署模式    ${NC}"
     echo -e "${BLUE}======================================${NC}"
-    echo -e "  ${GREEN}1.${NC} 小白一键部署 (无需域名, 自动生成 VLESS Reality + HY2 自签)"
-    echo -e "  ${YELLOW}2.${NC} 我要折腾 (需 Cloudflare 域名, 自动配 VLESS WS TLS + HY2 TLS)"
+    echo -e "  ${GREEN}1.${NC} 小白一键部署 (无需真实域名, 自建伪装/自签)"
+    echo -e "  ${YELLOW}2.${NC} 我要折腾 (需 Cloudflare 真实域名, 建站防御)"
     echo -e "${BLUE}======================================${NC}"
     read -rp "请选择 [1-2, 默认1]: " deploy_mode
     
@@ -328,71 +328,80 @@ install_singbox() {
 }
 
 install_simple() {
-    echo -e "${BLUE}开始 [小白模式] 部署...${NC}"
+    echo -e "\n${BLUE}========== [小白模式] ==========${NC}"
+    echo -e "请选择想要部署的协议："
+    echo -e "  ${GREEN}1.${NC} 仅部署 VLESS Reality 直连 (苹果/微软域名伪装)"
+    echo -e "  ${GREEN}2.${NC} 仅部署 Hysteria2 (本地强加密自签证书)"
+    echo -e "  ${YELLOW}3.${NC} 部署以上全部双协议 (全家桶备用)"
+    read -rp "请选择 [1-3, 默认3]: " proto_choice
+    proto_choice=${proto_choice:-3}
     
     echo -e "${BLUE}正在安装 Sing-box 核心...${NC}"
     download_singbox || return 1
     
-    echo -e "${BLUE}正在生成自动配置...${NC}"
-    local re_out=$(/usr/bin/sing-box generate reality-keypair)
-    local priv_key=$(echo "$re_out" | awk '/PrivateKey/ {print $NF}' | tr -d '\r\n ')
-    local pub_key=$(echo "$re_out" | awk '/PublicKey/ {print $NF}' | tr -d '\r\n ')
-    
+    local inbounds_json=""
     mkdir -p "$CONF_DIR"
-    echo "$pub_key" > "$CONF_DIR/pub.key"
     
-    local uuid_vless=$(uuidgen)
-    local uuid_hy2=$(uuidgen)
-    local sid=$(openssl rand -hex 8)
-    local sni_domain="www.bing.com"
-    
-    echo -e "${BLUE}正在为 HY2 生成自签临时证书...${NC}"
-    openssl req -x509 -nodes -newkey rsa:2048 -days 36500 \
-        -keyout "$CONF_DIR/self.key" -out "$CONF_DIR/self.crt" \
-        -subj "/C=US/ST=CA/L=Los Angeles/O=SingBox/CN=bing.com" 2>/dev/null
-    
-    cat > "$CONF_DIR/config.json" <<EOF
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
+    # 准备 VLESS Reality
+    if [ "$proto_choice" == "1" ] || [ "$proto_choice" == "3" ]; then
+        echo -e "\n${BLUE}请选择 Reality 顶级伪装域名 (SNI):${NC}"
+        echo -e "  1. ${GREEN}swdist.apple.com${NC} (苹果官方分发，极速防封推荐)"
+        echo -e "  2. ${GREEN}www.bing.com${NC} (微软旧式)"
+        echo -e "  3. ${YELLOW}自定义输入${NC}"
+        read -rp "请选择 [1-3, 默认1]: " sni_choice
+        case "$sni_choice" in
+            2) sni_domain="www.bing.com" ;;
+            3) read -rp "请输入自定义域名: " sni_domain ;;
+            *) sni_domain="swdist.apple.com" ;;
+        esac
+        sni_domain=${sni_domain:-swdist.apple.com}
+        
+        local re_out=$(/usr/bin/sing-box generate reality-keypair)
+        local priv_key=$(echo "$re_out" | awk '/PrivateKey/ {print $NF}' | tr -d '\r\n ')
+        local pub_key=$(echo "$re_out" | awk '/PublicKey/ {print $NF}' | tr -d '\r\n ')
+        echo "$pub_key" > "$CONF_DIR/pub.key"
+        
+        local uuid_vless=$(uuidgen)
+        local sid=$(openssl rand -hex 8)
+        
+        vless_json=$(cat <<EOF
     {
       "type": "vless",
       "tag": "vless-in",
       "listen": "::",
       "listen_port": 443,
-      "users": [
-        {
-          "uuid": "$uuid_vless",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
+      "users": [ { "uuid": "$uuid_vless", "flow": "xtls-rprx-vision" } ],
       "tls": {
         "enabled": true,
         "server_name": "$sni_domain",
         "reality": {
           "enabled": true,
-          "handshake": {
-            "server": "$sni_domain",
-            "server_port": 443
-          },
+          "handshake": { "server": "$sni_domain", "server_port": 443 },
           "private_key": "$priv_key",
           "short_id": ["$sid"]
         }
       }
-    },
+    }
+EOF
+)
+        inbounds_json="$vless_json"
+    fi
+    
+    # 准备 Hysteria2 (自签强密码)
+    if [ "$proto_choice" == "2" ] || [ "$proto_choice" == "3" ]; then
+        local uuid_hy2=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+        echo -e "${BLUE}正在为 HY2 生成隐蔽度极强的自签证书...${NC}"
+        openssl req -x509 -nodes -newkey rsa:2048 -days 36500 \
+            -keyout "$CONF_DIR/self.key" -out "$CONF_DIR/self.crt" \
+            -subj "/C=US/ST=CA/L=Cupertino/O=Apple/OU=OS/CN=swdist.apple.com" 2>/dev/null
+            
+        hy2_json=$(cat <<EOF
     {
       "type": "hysteria2",
       "tag": "hy2-in",
       "listen": "::",
       "listen_port": 8443,
-      "users": [
-        {
-          "password": "$uuid_hy2"
-        }
-      ],
+      "users": [ { "password": "$uuid_hy2" } ],
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -400,12 +409,23 @@ install_simple() {
         "key_path": "$CONF_DIR/self.key"
       }
     }
+EOF
+)
+        if [ -n "$inbounds_json" ]; then
+            inbounds_json="$inbounds_json, $hy2_json"
+        else
+            inbounds_json="$hy2_json"
+        fi
+    fi
+    
+    # 组装动态配置
+    cat > "$CONF_DIR/config.json" <<EOF
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+$inbounds_json
   ],
-  "outbounds": [
-    {
-      "type": "direct"
-    }
-  ]
+  "outbounds": [ { "type": "direct" } ]
 }
 EOF
     
@@ -413,9 +433,14 @@ EOF
 }
 
 install_advanced() {
-    echo -e "${BLUE}开始 [折腾模式] 部署...${NC}"
+    echo -e "\n${BLUE}========== [折腾模式] ==========${NC}"
+    echo -e "为保证建站稳定性和极简性，本模式强制不双开资源："
+    echo -e "  ${GREEN}1.${NC} 仅部署 VLESS + WebSocket + TLS (套 Cloudflare 不怕墙)"
+    echo -e "  ${GREEN}2.${NC} 仅部署 Hysteria2 (真实证书速度加持)"
+    read -rp "请选择单一部署 [1-2, 默认1]: " adv_choice
+    adv_choice=${adv_choice:-1}
     
-    read -rp "请输入绑定 Cloudflare 的真实域名: " DOMAIN
+    read -rp "请输入绑定本机的真实域名: " DOMAIN
     if [ -z "$DOMAIN" ]; then
         echo -e "${RED}域名不能为空${NC}"
         sleep 2 && main_menu
@@ -425,12 +450,8 @@ install_advanced() {
     read -rp "请输入邮箱用于申请证书: " EMAIL
     EMAIL=${EMAIL:-admin@$DOMAIN}
     
-    read -rp "请输入 VLESS WS 路径 (默认 /vless): " ws_path
-    ws_path=${ws_path:-/vless}
-    [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
-    
     setup_certificate "$DOMAIN" "$EMAIL" || {
-        echo -e "${RED}证书配置失败，无法继续${NC}"
+        echo -e "${RED}证书申请与验证失败，无法继续${NC}"
         sleep 3
         main_menu
         return
@@ -439,28 +460,23 @@ install_advanced() {
     echo -e "${BLUE}正在安装 Sing-box 核心...${NC}"
     download_singbox || return 1
     
-    echo -e "${BLUE}正在生成 WebSocket 大神配置...${NC}"
+    local inbounds_json=""
     mkdir -p "$CONF_DIR"
-    local uuid_vless=$(uuidgen)
-    local uuid_hy2=$(uuidgen)
     
-    cat > "$CONF_DIR/config.json" <<EOF
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
+    if [ "$adv_choice" == "1" ]; then
+        read -rp "请输入 VLESS 伪装路径 (默认 /vless): " ws_path
+        ws_path=${ws_path:-/vless}
+        [[ "$ws_path" != /* ]] && ws_path="/$ws_path"
+        
+        local uuid_vless=$(uuidgen)
+        
+        inbounds_json=$(cat <<EOF
     {
       "type": "vless",
       "tag": "vless-ws-in",
       "listen": "::",
       "listen_port": 443,
-      "users": [
-        {
-          "uuid": "$uuid_vless"
-        }
-      ],
+      "users": [ { "uuid": "$uuid_vless" } ],
       "tls": {
         "enabled": true,
         "server_name": "$DOMAIN",
@@ -473,17 +489,18 @@ install_advanced() {
         "max_early_data": 2048,
         "early_data_header_name": "Sec-WebSocket-Protocol"
       }
-    },
+    }
+EOF
+)
+    else
+        local uuid_hy2=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
+        inbounds_json=$(cat <<EOF
     {
       "type": "hysteria2",
       "tag": "hy2-in",
       "listen": "::",
       "listen_port": 8443,
-      "users": [
-        {
-          "password": "$uuid_hy2"
-        }
-      ],
+      "users": [ { "password": "$uuid_hy2" } ],
       "tls": {
         "enabled": true,
         "server_name": "$DOMAIN",
@@ -492,12 +509,18 @@ install_advanced() {
         "key_path": "$CERT_DIR/server.key"
       }
     }
+EOF
+)
+    fi
+    
+    # 组装动态配置
+    cat > "$CONF_DIR/config.json" <<EOF
+{
+  "log": { "level": "info", "timestamp": true },
+  "inbounds": [
+$inbounds_json
   ],
-  "outbounds": [
-    {
-      "type": "direct"
-    }
-  ]
+  "outbounds": [ { "type": "direct" } ]
 }
 EOF
     
@@ -532,7 +555,7 @@ check_service() {
     read && main_menu
 }
 
-# --- [ 9. 展示配置 ] ---
+# --- [ 9. 展示配置与二维码 ] ---
 show_config() {
     clear
     echo -e "${BLUE}======================================${NC}"
@@ -548,55 +571,80 @@ show_config() {
     
     get_ip
     
-    local is_ws=$(jq -r '.inbounds[0].transport.type // empty' "$CONF_DIR/config.json")
-    local uuid_vless=$(jq -r '.inbounds[0].users[0].uuid' "$CONF_DIR/config.json")
-    local uuid_hy2=$(jq -r '.inbounds[1].users[0].password' "$CONF_DIR/config.json")
-    local vless_link=""
-    local hy2_link=""
+    # 利用 jq 动态查询存在哪些核心协议
+    local vless_idx=$(jq -r '.inbounds | to_entries | map(select(.value.type == "vless")) | .[0].key // empty' "$CONF_DIR/config.json")
+    local hy2_idx=$(jq -r '.inbounds | to_entries | map(select(.value.type == "hysteria2")) | .[0].key // empty' "$CONF_DIR/config.json")
     
-    if [ "$is_ws" == "ws" ]; then
-        # ==== 折腾模式：VLESS WS TLS ====
-        local domain=$(jq -r '.inbounds[0].tls.server_name' "$CONF_DIR/config.json")
-        local ws_path=$(jq -r '.inbounds[0].transport.path' "$CONF_DIR/config.json")
-        vless_link="vless://$uuid_vless@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&path=$(echo -n "$ws_path" | jq -sRr @uri)#VLESS_WS_${domain}"
-        hy2_link="hysteria2://$uuid_hy2@$domain:8443?sni=$domain&alpn=h3&insecure=0#HY2_${domain}"
+    if [ -z "$vless_idx" ] && [ -z "$hy2_idx" ]; then
+        echo -e "${RED}当前配置文件未包含受支持的标准协议入站！${NC}"
+    fi
+
+    # ========== 解析输出 VLESS 节点 ==========
+    if [ -n "$vless_idx" ]; then
+        local is_ws=$(jq -r ".inbounds[$vless_idx].transport.type // empty" "$CONF_DIR/config.json")
+        local uuid_vless=$(jq -r ".inbounds[$vless_idx].users[0].uuid" "$CONF_DIR/config.json")
         
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${GREEN}VLESS + WebSocket + TLS (TCP 443)${NC}"
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "UUID: ${BLUE}$uuid_vless${NC}"
-        echo -e "域名: ${BLUE}$domain${NC}"
-        echo -e "路径 (Path): ${BLUE}$ws_path${NC}"
-        echo -e "链接: $vless_link"
-        echo ""
-        qrencode -t UTF8 "$vless_link"
-    else
-        # ==== 小白模式：VLESS Reality ====
-        local pub_key=$(cat "$CONF_DIR/pub.key" 2>/dev/null || echo "未找到")
-        local sid=$(jq -r '.inbounds[0].tls.reality.short_id[0]' "$CONF_DIR/config.json")
-        local sni=$(jq -r '.inbounds[0].tls.server_name' "$CONF_DIR/config.json")
-        vless_link="vless://$uuid_vless@$IP:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pub_key&sid=$sid&type=tcp#Reality_${IP}"
-        
-        # HY2 自签
-        hy2_link="hysteria2://$uuid_hy2@$IP:8443?insecure=1#HY2_SelfSigned_${IP}"
-        
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${GREEN}VLESS Reality (TCP 443)${NC}"
-        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "UUID: ${BLUE}$uuid_vless${NC}"
-        echo -e "伪装SNI: ${BLUE}$sni${NC}"
-        echo -e "链接: $vless_link"
-        echo ""
-        qrencode -t UTF8 "$vless_link"
+        if [ "$is_ws" == "ws" ]; then
+            # 折腾模式：VLESS WS TLS
+            local domain=$(jq -r ".inbounds[$vless_idx].tls.server_name" "$CONF_DIR/config.json")
+            local ws_path=$(jq -r ".inbounds[$vless_idx].transport.path" "$CONF_DIR/config.json")
+            local encoded_path=$(echo -n "$ws_path" | jq -sRr @uri)
+            local vless_link="vless://$uuid_vless@$domain:443?encryption=none&security=tls&sni=$domain&type=ws&path=${encoded_path}#VLESS_WS_${domain}"
+            
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${GREEN}VLESS + WebSocket + TLS (建站防御)${NC}"
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "UUID: ${BLUE}$uuid_vless${NC}"
+            echo -e "绑定域名: ${BLUE}$domain${NC}"
+            echo -e "伪装路径: ${BLUE}$ws_path${NC}"
+            echo -e "\n直接导入链接:\n$vless_link\n"
+            qrencode -t UTF8 "$vless_link"
+        else
+            # 小白模式：VLESS Reality
+            local pub_key=$(cat "$CONF_DIR/pub.key" 2>/dev/null || echo "")
+            local sid=$(jq -r ".inbounds[$vless_idx].tls.reality.short_id[0]" "$CONF_DIR/config.json")
+            local sni=$(jq -r ".inbounds[$vless_idx].tls.server_name" "$CONF_DIR/config.json")
+            local vless_link="vless://$uuid_vless@$IP:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$sni&fp=chrome&pbk=$pub_key&sid=$sid&type=tcp#Reality_${IP}"
+            
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${GREEN}VLESS Reality (隐匿直连极速版)${NC}"
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "UUID: ${BLUE}$uuid_vless${NC}"
+            echo -e "伪装站点: ${BLUE}$sni${NC}"
+            echo -e "\n直接导入链接:\n$vless_link\n"
+            qrencode -t UTF8 "$vless_link"
+        fi
     fi
     
-    echo -e "\n${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Hysteria2 (UDP 8443)${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "密码: ${BLUE}$uuid_hy2${NC}"
-    echo -e "链接: $hy2_link"
-    echo ""
-    qrencode -t UTF8 "$hy2_link"
+    # ========== 解析输出 HY2 节点 ==========
+    if [ -n "$hy2_idx" ]; then
+        local uuid_hy2=$(jq -r ".inbounds[$hy2_idx].users[0].password" "$CONF_DIR/config.json")
+        local is_self_signed=$(jq -r ".inbounds[$hy2_idx].tls.certificate_path" "$CONF_DIR/config.json" | grep "self.crt" || echo "")
+        local domain=$(jq -r ".inbounds[$hy2_idx].tls.server_name // empty" "$CONF_DIR/config.json")
+        
+        if [ -n "$is_self_signed" ] || [ -z "$domain" ]; then
+            # 小白模式自签 HY2
+            local hy2_link="hysteria2://$uuid_hy2@$IP:8443?insecure=1#HY2_SelfSigned_${IP}"
+            
+            echo -e "\n${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${GREEN}Hysteria2 自签版 (硬核加密直连)${NC}"
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "高强密码: ${BLUE}$uuid_hy2${NC}"
+            echo -e "\n直接导入链接:\n$hy2_link\n"
+            qrencode -t UTF8 "$hy2_link"
+        else
+            # 折腾模式域名 HY2
+            local hy2_link="hysteria2://$uuid_hy2@$domain:8443?sni=$domain&alpn=h3&insecure=0#HY2_Domain_${domain}"
+            
+            echo -e "\n${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${GREEN}Hysteria2 域名版 (大厂证书加持)${NC}"
+            echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "高强密码: ${BLUE}$uuid_hy2${NC}"
+            echo -e "绑定域名: ${BLUE}$domain${NC}"
+            echo -e "\n直接导入链接:\n$hy2_link\n"
+            qrencode -t UTF8 "$hy2_link"
+        fi
+    fi
     
     echo -e "\n${BLUE}按回车键返回主菜单...${NC}"
     read && main_menu
