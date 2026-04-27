@@ -307,10 +307,9 @@ EOF
     systemctl daemon-reload
     systemctl enable sing-box
     
-    if systemctl start sing-box; then
+    if systemctl restart sing-box; then
         echo -e "${GREEN}部署完成！${NC}"
         sleep 2
-        show_config
     else
         echo -e "${RED}服务启动失败，日志：${NC}"
         journalctl -u sing-box --no-pager -n 20
